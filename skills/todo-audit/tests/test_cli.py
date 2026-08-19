@@ -384,5 +384,67 @@ class TestClaimVisibility(unittest.TestCase):
         self.assertNotIn('T-002', out)
 
 
+class TestInit(unittest.TestCase):
+    """init 是唯一會建庫的指令（2026-08-20）。
+
+    在此之前建庫能力只綁在 migrate_md_to_db.py 裡，而那支對沒有舊 md 的
+    專案直接 skip 不建庫 —— 全新專案永遠開不了第一條待辦。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        # 刻意不建 .claude/todos/.audit —— 首次安裝時它並不存在，
+        # 而 sqlite3.connect 只建檔不建父目錄。開發者的機器上這個目錄
+        # 早就存在，所以這個缺陷只有在乾淨 HOME 才會顯形。
+        self.audit = self.home / '.claude' / 'todos' / '.audit'
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_init_creates_db_when_audit_dir_does_not_exist(self):
+        self.assertFalse(self.audit.exists())
+        r = run_cli('init', '--project', 'fresh', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.audit / 'fresh.sqlite').exists())
+
+    def test_init_is_idempotent(self):
+        run_cli('init', '--project', 'fresh', env_home=self.home)
+        before = (self.audit / 'fresh.sqlite').read_bytes()
+        r = run_cli('init', '--project', 'fresh', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.audit / 'fresh.sqlite').read_bytes(), before,
+                         'init 對既有 DB 不得有任何位元改動')
+
+    def test_missing_db_points_at_init_not_the_migration_script(self):
+        # 舊訊息叫人去跑 migrate_md_to_db.py，但那支對新專案不建庫 ——
+        # 錯誤訊息把人導向一條走不通的路，比沒有訊息更糟。
+        r = run_cli('list', '--project', 'fresh', env_home=self.home)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('init', r.stderr)
+
+    def test_non_init_commands_never_create_the_db(self):
+        # 打錯專案名時靜默建出空庫，會讓「打錯字」偽裝成「沒有待辦」。
+        for cmd in ('list', 'stats', 'dump'):
+            with self.subTest(cmd=cmd):
+                run_cli(cmd, '--project', 'typo-project', env_home=self.home)
+                self.assertFalse((self.audit / 'typo-project.sqlite').exists())
+
+    def test_add_works_after_init(self):
+        run_cli('init', '--project', 'fresh', env_home=self.home)
+        r = run_cli('add', '新條目', '🏷️  t', '💡  n',
+                    '--project', 'fresh', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = run_cli('list', '--project', 'fresh', env_home=self.home).stdout
+        self.assertIn('新條目', out)
+
+    def test_init_only_touches_its_own_project(self):
+        run_cli('init', '--project', 'alpha', env_home=self.home)
+        run_cli('init', '--project', 'beta', env_home=self.home)
+        self.assertTrue((self.audit / 'alpha.sqlite').exists())
+        self.assertTrue((self.audit / 'beta.sqlite').exists())
+        self.assertEqual(len(list(self.audit.glob('*.sqlite'))), 2)
+
+
 if __name__ == '__main__':
     unittest.main()

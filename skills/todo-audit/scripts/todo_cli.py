@@ -257,6 +257,37 @@ def cmd_audit(con, args):
                             str(db_for(args.project_resolved)), '.'])
 
 
+def cmd_init(con, args):
+    """為新專案建立待辦庫。**唯一會建庫的指令。**
+
+    建庫本身已由 main() 的 todo_store.connect(db) 完成 —— connect 是
+    idempotent 的（CREATE TABLE IF NOT EXISTS ＋ 容錯 migration），
+    故本函式只負責回報，不重複建表。
+
+    為什麼需要這支指令（2026-08-20）：建庫能力原本只綁在
+    migrate_md_to_db.py 裡，而那支對沒有舊 md 的專案輸出 "skip: no md"
+    直接返回、不建庫 —— 於是全新專案永遠開不了第一條待辦，而錯誤訊息
+    還指向那支不會建庫的腳本。
+
+    為什麼不讓任何讀寫指令自動建庫：專案名打錯時會靜默生出一個空庫，
+    把「打錯字」偽裝成「這個專案還沒有待辦」。這兩者的正確反應相反，
+    而錯的那個不會有任何錯誤訊息。建庫必須是明確意圖。
+    """
+    db = db_for(args.project_resolved)
+
+    if not args.db_existed:
+        print(f'✅ 已建立 {db}')
+        print(f'   專案：{args.project_resolved}')
+        print('   下一步：bash ~/.claude/hooks/todo-add.sh "標題" '
+              '"🏷️  tags" "💡  上次做到哪：X，下一步：Y"')
+        return 0
+
+    # ── TODO：DB 已存在時的行為（見下方說明，待決定）──
+    # 目前先以「明確告知＋不改動」收尾，回傳 0。
+    print(f'ℹ️  {db} 已存在，未做任何改動。')
+    return 0
+
+
 def main():
     # --project 同時掛在頂層與每個子指令上，讓兩種順序都能用：
     #   todo_cli.py --project x list   ／   todo_cli.py list --project x
@@ -355,6 +386,10 @@ def main():
     p = sub.add_parser('audit', parents=[common])
     p.set_defaults(fn=cmd_audit)
 
+    p = sub.add_parser('init', parents=[common],
+                       help='為新專案建立待辦庫（唯一會建庫的指令）')
+    p.set_defaults(fn=cmd_init)
+
     args = ap.parse_args()
     # SUPPRESS 的選項沒給時屬性不存在，故一律用 getattr
     project = getattr(args, 'project', None) or Path.cwd().name
@@ -362,9 +397,22 @@ def main():
     args.path = getattr(args, 'path', None)
     args.remote = getattr(args, 'remote', '(no-remote)')
     db = db_for(project)
-    if not db.exists():
-        print(f'找不到 {db} —— 先跑 migrate_md_to_db.py', file=sys.stderr)
+    # 必須在 connect() 之前快照 —— connect 會把 DB 建出來，
+    # 等 cmd_init 拿到 con 時「原本存不存在」已被自己的副作用抹掉。
+    args.db_existed = db.exists()
+    # init 是唯一豁免的指令：它的職責就是把「不存在」變成「存在」。
+    # 其餘指令一律擋下而非自動建庫 —— 理由見 cmd_init 的 docstring。
+    if args.cmd != 'init' and not args.db_existed:
+        print(f'找不到 {db}', file=sys.stderr)
+        print(f'  新專案 → python3 {Path(__file__).resolve()} init', file=sys.stderr)
+        print('  舊 md 遷移 → python3 migrate_md_to_db.py', file=sys.stderr)
         return 2
+    if args.cmd == 'init':
+        # sqlite3.connect 會建檔，但不會建父目錄 —— 首次安裝時 .audit/
+        # 還不存在，直接 connect 會拋 OperationalError。
+        # 只在 init 建目錄：放進 todo_store.connect() 會讓任何一次讀取都
+        # 默默造出目錄，繞過「建庫必須是明確意圖」這條規則。
+        db.parent.mkdir(parents=True, exist_ok=True)
     con = todo_store.connect(db)
     try:
         if args.path:

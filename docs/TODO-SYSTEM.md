@@ -125,6 +125,11 @@ DB 在 `~/.claude/todos/.audit/{project}.sqlite` —— 按專案隔離，且**�
 ```bash
 T=~/.claude/skills/todo-audit/scripts/todo_cli.py
 
+# 新專案第一次使用 —— 唯一會建庫的指令
+# （其餘指令找不到 DB 一律 exit 2 並指路，不自動建庫：
+#   打錯專案名時靜默建空庫，會把「打錯字」偽裝成「沒有待辦」）
+python3 $T init
+
 # 查看待辦（必須在 git repo root。輸出自帶新鮮度與逐條 state）
 python3 $T list [--section urgent|decision|normal|later] [--doing]
 python3 $T search <關鍵字> [--all]      # 全文搜尋（標題＋內文，大小寫不敏感）

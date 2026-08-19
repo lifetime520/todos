@@ -100,6 +100,9 @@ ln -sfn "$REPO/docs/TODO-SYSTEM.md" ~/.claude/docs/TODO-SYSTEM.md
 ```bash
 T=~/.claude/skills/todo-audit/scripts/todo_cli.py
 
+# 新專案第一次使用（唯一會建庫的指令）
+python3 $T init
+
 # 讀（輸出自帶新鮮度與逐條 state）
 python3 $T list [--section urgent|decision|normal|later] [--doing] [--by 誰]
 python3 $T search <關鍵字> [--all]
@@ -117,6 +120,10 @@ python3 $T mark <T-NNN> doing --by <誰>
 python3 $T mark <T-NNN> pending --by <誰>
 python3 $T audit
 ```
+
+**為什麼建庫要用獨立指令**：讓任何讀寫指令自動建庫，會在專案名打錯時靜默生出一個空庫，
+把「打錯字」偽裝成「這個專案還沒有待辦」—— 這兩者的正確反應相反，而錯的那個不會有任何錯誤訊息。
+所以 `init` 之外的指令找不到 DB 一律 exit 2 並指路，不自作主張。
 
 完整指令與格式規範見 [`docs/TODO-SYSTEM.md`](docs/TODO-SYSTEM.md)。
 

@@ -24,6 +24,9 @@ description: Use when auditing a project todo list for stale entries, detecting 
 ```bash
 T=~/.claude/skills/todo-audit/scripts/todo_cli.py
 
+# 建（新專案第一次使用，唯一會建庫的指令）
+python3 $T init
+
 # 讀
 python3 $T list [--section urgent|decision|normal|later] [--doing] [--by 誰]
 python3 $T search <關鍵字> [--all]        # 全文搜尋，大小寫不敏感
