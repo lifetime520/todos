@@ -446,5 +446,59 @@ class TestInit(unittest.TestCase):
         self.assertEqual(len(list(self.audit.glob('*.sqlite'))), 2)
 
 
+class TestSimilarWithMixedLineOrigins(unittest.TestCase):
+    """similar 的排序 tuple 帶著 md_line，而該欄位有兩種來源：
+
+    md 遷移來的條目是整數行號，append_item() 建的條目是 NULL（它的 INSERT
+    根本沒列 md_line）。兩條同分時 tuple 比較就會拿 int 去比 None 而炸。
+    兩條都 NULL 反而不炸 —— tuple 先用 == 比，None == None 為真就跳過去了，
+    所以必須新舊混合才重現得出來。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        audit = self.home / '.claude' / 'todos' / '.audit'
+        audit.mkdir(parents=True)
+        con = todo_store.connect(audit / 'demo.sqlite')
+
+        # 三條共用同一個錨點，彼此都能配對上。A / B 標題逐字相同，
+        # 因此 score / anchor_j / text_j 三個數值欄位必然相等，
+        # 排序只能往下比第四欄 md_line —— 正是本測試要釘住的那一格。
+        rows = [
+            ('k-query', '查詢對象 BtseOkHttpClient.java 排查', 7),
+            ('k-old', '撤單失敗 BtseOkHttpClient.java 修正', 42),
+            ('k-new', '撤單失敗 BtseOkHttpClient.java 修正', None),
+        ]
+        for i, (key, title, md_line) in enumerate(rows):
+            full = f'[2026-08-16] {title}'
+            con.execute(
+                'INSERT INTO todo(key,date,title,raw_title,section,'
+                'sort_order,status,md_line) VALUES(?,?,?,?,?,?,?,?)',
+                (key, '2026-08-16', full, f'- [ ] {full}', 'normal',
+                 i + 1, 'pending', md_line))
+        con.commit()
+        todo_store.assign_short_ids(con)
+        con.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_similar_survives_null_and_int_line_numbers_at_equal_score(self):
+        r = run_cli('similar', 'k-query', '--project', 'demo',
+                    env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('Traceback', r.stderr)
+        self.assertIn('撤單失敗', r.stdout)
+
+    def test_similar_does_not_print_LNone_for_db_native_items(self):
+        # 印 LNone 等於把人導向一個不存在的行號。DB 原生條目沒有 md 行號
+        # 是常態，不是異常。
+        r = run_cli('similar', 'k-query', '--project', 'demo',
+                    env_home=self.home)
+        self.assertNotIn('LNone', r.stdout)
+
+
+
 if __name__ == '__main__':
     unittest.main()

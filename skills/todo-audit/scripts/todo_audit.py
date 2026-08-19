@@ -557,17 +557,23 @@ def similar_mode(todo_path, query, topn=5, exclude_title=None):
         # 取兩者較大者：錨點與文字是互斥的訊號源，任一夠強就值得提示
         score = max(anchor_j, text_j)
         if score >= 0.12:
+            # 存格式化後的行號而非原值：本函式把 todo dict 拆成 tuple，
+            # _loc() 的 dict 簽名在這裡對不上，當初就漏用了它。
             scored.append((round(score, 3), round(anchor_j, 3), round(text_j, 3),
-                           t['line'], t['date'], t['title'], sorted(qset & aset)[:4]))
+                           _loc(t), t['date'], t['title'], sorted(qset & aset)[:4]))
 
-    scored.sort(reverse=True)
+    # 只拿三個分數欄位當 key。裸 sort 會在同分時往下比第四欄，而 md 遷移來的
+    # 條目有整數行號、append_item() 建的沒有（它的 INSERT 沒列 md_line），
+    # 新舊同分就 int 比 None 而炸。同分先後改由 sort 的穩定性決定 —— 比拿一個
+    # 半數為 NULL 的欄位當 tiebreaker 更可預期。
+    scored.sort(key=lambda r: r[:3], reverse=True)
     if not scored:
         print('✓ 未發現相似的既有條目')
         return
     print(f'⚠️  發現 {len(scored)} 條相似的既有條目 —— 這是提示，不是阻擋。')
     print('   高相似 ≠ 重複：同一件事的兩半也會高分，那種情況兩條都該留。\n')
-    for sc, aj, tj, ln, date, title, shared in scored[:topn]:
-        print(f'  [{sc}] L{ln} [{date}] {title[:60]}')
+    for sc, aj, tj, loc, date, title, shared in scored[:topn]:
+        print(f'  [{sc}] {loc} [{date}] {title[:60]}')
         print(f'        錨點={aj} 文字={tj}' + (f'  共用: {", ".join(shared)}' if shared else ''))
     print('\n  處置：(a) 合併進既有條目  (b) 另立新條並互相 link  (c) 忽略提示')
 
