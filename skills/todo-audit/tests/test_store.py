@@ -1,0 +1,496 @@
+import sqlite3
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
+import todo_store
+
+
+class TestSchema(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self.tmp.name) / 't.sqlite'
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_migration_adds_columns_to_fresh_db(self):
+        con = todo_store.connect(self.db)
+        cols = {r[1] for r in con.execute('PRAGMA table_info(todo)')}
+        for c in ('raw_title', 'section', 'group_marker', 'sort_order',
+                  'status', 'status_by', 'status_at', 'status_note', 'short_id'):
+            self.assertIn(c, cols, f'missing column {c}')
+        con.close()
+
+    def test_migration_preserves_existing_rows(self):
+        # 先造一個「舊版」DB：只有原始六表與一列資料
+        con = sqlite3.connect(self.db)
+        con.executescript("""
+            CREATE TABLE todo(key TEXT PRIMARY KEY, date TEXT, title TEXT,
+              first_seen_run INT, last_seen_run INT, content_hash TEXT);
+        """)
+        con.execute("INSERT INTO todo VALUES('abc','2026-08-08','old title',1,1,'h')")
+        con.commit()
+        con.close()
+
+        con = todo_store.connect(self.db)
+        row = con.execute("SELECT date, title FROM todo WHERE key='abc'").fetchone()
+        self.assertEqual(row, ('2026-08-08', 'old title'))
+        con.close()
+
+    def test_migration_is_idempotent(self):
+        todo_store.connect(self.db).close()
+        todo_store.connect(self.db).close()   # 第二次不得拋錯
+        con = todo_store.connect(self.db)
+        cols = {r[1] for r in con.execute('PRAGMA table_info(todo)')}
+        self.assertIn('short_id', cols)
+        con.close()
+
+    def test_todo_key_matches_legacy_algorithm(self):
+        # 必須與 todo_audit.py:110 完全一致，否則歷史 probe 斷鏈
+        import hashlib
+        expected = hashlib.sha1('2026-08-08|some title'.encode()).hexdigest()[:16]
+        self.assertEqual(todo_store.todo_key('2026-08-08', 'some title'), expected)
+
+    def test_todo_line_table_exists(self):
+        con = todo_store.connect(self.db)
+        con.execute("INSERT INTO todo_line VALUES('k',0,'💡','text')")
+        row = con.execute('SELECT marker, text FROM todo_line').fetchone()
+        self.assertEqual(row, ('💡', 'text'))
+        con.close()
+
+
+SAMPLE = """<!-- project_path: /x | git_remote: g -->
+
+# demo Pending
+
+> 前言說明
+
+## 🔴 立即處理（P0 / 資金安全）（1）
+
+- [ ] [2026-08-08] [P0] 第一條
+  > 🔗  ⚓ OrderService(15)
+  > 🏷️  tagA, tagB
+  > 💡  說明文字
+
+<!-- ⚓ OrderService -->
+
+- [ ] [2026-08-07] 第二條
+  > 🏷️  tagC
+  > 💡  多行說明第一段
+  > 💡  多行說明第二段
+  > ⚠️  警告
+"""
+
+
+class TestLosslessParse(unittest.TestCase):
+    def test_item_count_and_order(self):
+        p = todo_store.parse_md_lossless(SAMPLE)
+        self.assertEqual(len(p['items']), 2)
+        self.assertEqual(p['items'][0]['sort_order'], 0)
+        self.assertEqual(p['items'][1]['sort_order'], 1)
+
+    def test_raw_title_preserved_verbatim(self):
+        p = todo_store.parse_md_lossless(SAMPLE)
+        self.assertEqual(p['items'][0]['raw_title'],
+                         '- [ ] [2026-08-08] [P0] 第一條')
+
+    def test_body_raw_keeps_indentation(self):
+        # 這是與 todo_audit.py:178 的關鍵差異：不得 strip
+        p = todo_store.parse_md_lossless(SAMPLE)
+        self.assertEqual(p['items'][0]['body_raw'][0], '  > 🔗  ⚓ OrderService(15)')
+
+    def test_group_marker_captured(self):
+        p = todo_store.parse_md_lossless(SAMPLE)
+        self.assertIsNone(p['items'][0]['group_marker'])
+        self.assertEqual(p['items'][1]['group_marker'], '<!-- ⚓ OrderService -->')
+
+    def test_repeated_marker_kept_as_separate_lines(self):
+        # 實測 tradingbot.md：💡 出現 195 次但只有 188 條，7 條帶多個 💡
+        p = todo_store.parse_md_lossless(SAMPLE)
+        markers = [todo_store.line_marker(l) for l in p['items'][1]['body_raw']]
+        self.assertEqual(markers, ['🏷️', '💡', '💡', '⚠️'])
+
+    def test_key_matches_legacy_title_stripping(self):
+        p = todo_store.parse_md_lossless(SAMPLE)
+        # legacy: title = raw[6:].strip()
+        self.assertEqual(p['items'][0]['title'], '[2026-08-08] [P0] 第一條')
+        self.assertEqual(p['items'][0]['key'],
+                         todo_store.todo_key('2026-08-08', '[2026-08-08] [P0] 第一條'))
+
+    def test_audit_shape_matches_legacy_parser(self):
+        p = todo_store.parse_md_lossless(SAMPLE)
+        shaped = todo_store.to_audit_shape(p)
+        self.assertEqual(shaped[0]['title'], '[2026-08-08] [P0] 第一條')
+        self.assertEqual(shaped[0]['date'], '2026-08-08')
+        # legacy body 是 strip 過的
+        self.assertEqual(shaped[0]['body'][0], '> 🔗  ⚓ OrderService(15)')
+
+
+class TestKeyCollision(unittest.TestCase):
+    def test_duplicate_title_same_date_both_survive_roundtrip(self):
+        dup = ("- [ ] [2026-08-08] 同名\n  > 💡  A\n\n"
+               "- [ ] [2026-08-08] 同名\n  > 💡  B\n")
+        p = todo_store.parse_md_lossless(dup)
+        self.assertEqual(len(p['items']), 2)
+        self.assertEqual(todo_store.render(p), dup)
+
+    def test_trailing_newline_preserved(self):
+        # 檔尾換行是 byte-identical 的常見破口
+        t = "- [ ] [2026-08-08] x\n  > 💡  y\n"
+        self.assertEqual(todo_store.render(todo_store.parse_md_lossless(t)), t)
+
+    def test_empty_document_roundtrips(self):
+        self.assertEqual(todo_store.render(todo_store.parse_md_lossless('')), '')
+
+
+class TestPersistence(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self.tmp.name) / 't.sqlite'
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_save_then_load_roundtrips_through_db(self):
+        parsed = todo_store.parse_md_lossless(SAMPLE)
+        con = todo_store.connect(self.db)
+        todo_store.save_parsed(con, 'demo', parsed)
+        reloaded = todo_store.load_parsed(con, 'demo')
+        self.assertEqual(todo_store.render(reloaded), SAMPLE)
+        con.close()
+
+    def test_short_ids_assigned_in_sort_order(self):
+        parsed = todo_store.parse_md_lossless(SAMPLE)
+        con = todo_store.connect(self.db)
+        todo_store.save_parsed(con, 'demo', parsed)
+        todo_store.assign_short_ids(con)
+        ids = [r[0] for r in con.execute(
+            'SELECT short_id FROM todo ORDER BY sort_order')]
+        self.assertEqual(ids, ['T-001', 'T-002'])
+        con.close()
+
+    def test_short_ids_are_not_reused_after_new_items(self):
+        con = todo_store.connect(self.db)
+        todo_store.save_parsed(con, 'demo', todo_store.parse_md_lossless(SAMPLE))
+        todo_store.assign_short_ids(con)
+        extra = SAMPLE + "\n- [ ] [2026-08-06] 第三條\n  > 💡  x\n"
+        todo_store.save_parsed(con, 'demo', todo_store.parse_md_lossless(extra))
+        todo_store.assign_short_ids(con)
+        ids = {r[0] for r in con.execute(
+            'SELECT short_id FROM todo WHERE short_id IS NOT NULL')}
+        self.assertIn('T-003', ids)
+        self.assertEqual(len(ids), 3)
+        con.close()
+
+    def test_default_status_is_pending(self):
+        con = todo_store.connect(self.db)
+        todo_store.save_parsed(con, 'demo', todo_store.parse_md_lossless(SAMPLE))
+        s = {r[0] for r in con.execute(
+            'SELECT status FROM todo WHERE sort_order IS NOT NULL')}
+        self.assertEqual(s, {'pending'})
+        con.close()
+
+    def test_save_is_idempotent_and_preserves_status(self):
+        # 遷移可重跑 —— 第二次不得把已標的 status 洗回 pending
+        con = todo_store.connect(self.db)
+        parsed = todo_store.parse_md_lossless(SAMPLE)
+        todo_store.save_parsed(con, 'demo', parsed)
+        key = parsed['items'][0]['key']
+        con.execute("UPDATE todo SET status='doing' WHERE key=?", (key,))
+        con.commit()
+        todo_store.save_parsed(con, 'demo', parsed)
+        st = con.execute('SELECT status FROM todo WHERE key=?', (key,)).fetchone()[0]
+        self.assertEqual(st, 'doing')
+        con.close()
+
+
+class TestReviewFindings(unittest.TestCase):
+    """釘住 2026-08-08 code review 抓到的四個問題，防回歸。"""
+
+    def test_line_marker_rejects_free_text(self):
+        # (\S+) 會把自由文字第一個詞當 marker，污染 todo_line.marker
+        self.assertIsNone(todo_store.line_marker('  > 說明文字沒有 marker'))
+        self.assertIsNone(todo_store.line_marker('  > TODO: 改用 X'))
+        self.assertIsNone(todo_store.line_marker('  > 2026-08-08 記錄'))
+        self.assertEqual(todo_store.line_marker('  > 💡  x'), '💡')
+        self.assertEqual(todo_store.line_marker('  > 🔍  y'), '🔍')
+
+    def test_section_follows_heading_over_title_marker(self):
+        # 人把條目搬進「不急」，標題殘留 [P0] 不該把它拉回 urgent
+        t = ("## ⚪ 觀察 / 技術債（不急）（1）\n\n"
+             "- [ ] [2026-08-08] [P0] 已被降級的事\n  > 💡  x\n")
+        p = todo_store.parse_md_lossless(t)
+        self.assertEqual(p['items'][0]['section'], 'later')
+        self.assertEqual(p['items'][0]['heading'], '## ⚪ 觀察 / 技術債（不急）（1）')
+
+    def test_section_falls_back_to_title_when_no_heading(self):
+        t = "- [ ] [2026-08-08] [P0] 沒有章節\n  > 💡  x\n"
+        self.assertEqual(
+            todo_store.parse_md_lossless(t)['items'][0]['section'], 'urgent')
+
+    def test_audit_shape_line_is_real_md_lineno(self):
+        # todo_audit.py 有五處直接印 L{line}，給序位會指向錯位置
+        p = todo_store.parse_md_lossless(SAMPLE)
+        shaped = todo_store.to_audit_shape(p)
+        lines = SAMPLE.split('\n')
+        for it in shaped:
+            self.assertTrue(lines[it['line'] - 1].startswith('- [ ] '),
+                            f"line {it['line']} 不是條目行")
+
+    def test_render_refuses_missing_item_instead_of_silent_drift(self):
+        t = ("# H\n\n- [ ] [2026-08-08] A\n  > 💡  a\n\n"
+             "<!-- ⚓ Foo -->\n\n- [ ] [2026-08-08] B\n  > 💡  b\n")
+        p = todo_store.parse_md_lossless(t)
+        p['items'] = [it for it in p['items'] if it['sort_order'] != 1]
+        with self.assertRaises(KeyError):
+            todo_store.render(p)
+
+
+class TestAppendItem(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.con = todo_store.connect(Path(self.tmp.name) / 't.sqlite')
+
+    def tearDown(self):
+        self.con.close()
+        self.tmp.cleanup()
+
+    def _body(self, key):
+        return [t for (t,) in self.con.execute(
+            'SELECT text FROM todo_line WHERE todo_key=? ORDER BY seq', (key,))]
+
+    def test_marker_not_duplicated(self):
+        # todo-add.sh 的介面是 "🏷️  a, b"（自帶 marker），不可再補一個
+        todo_store.append_item(self.con, 'p', '標題', '🏷️  a, b', '💡  說明')
+        key = self.con.execute('SELECT key FROM todo').fetchone()[0]
+        body = self._body(key)
+        self.assertEqual(body[0], '  > 🏷️  a, b')
+        self.assertEqual(body[1], '  > 💡  說明')
+        self.assertNotIn('🏷️  🏷️', '\n'.join(body))
+
+    def test_empty_tag_or_note_creates_no_line(self):
+        todo_store.append_item(self.con, 'p', '只有標題', '', '')
+        key = self.con.execute('SELECT key FROM todo').fetchone()[0]
+        self.assertEqual(self._body(key), [])
+
+    def test_appended_item_roundtrips(self):
+        todo_store.append_item(self.con, 'p', '標題', '🏷️  x', '💡  y')
+        key = self.con.execute('SELECT key FROM todo').fetchone()[0]
+        raw = self.con.execute('SELECT raw_title FROM todo WHERE key=?',
+                               (key,)).fetchone()[0]
+        self.assertTrue(raw.startswith('- [ ] ['))
+        self.assertTrue(raw.endswith('標題'))
+
+
+class TestEditAndRemove(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.con = todo_store.connect(Path(self.tmp.name) / 't.sqlite')
+        todo_store.save_parsed(self.con, 'demo',
+                               todo_store.parse_md_lossless(SAMPLE))
+        todo_store.assign_short_ids(self.con)
+        self.key = self.con.execute(
+            'SELECT key FROM todo WHERE sort_order=0').fetchone()[0]
+
+    def tearDown(self):
+        self.con.close()
+        self.tmp.cleanup()
+
+    def _body(self, key):
+        return [t for (t,) in self.con.execute(
+            'SELECT text FROM todo_line WHERE todo_key=? ORDER BY seq', (key,))]
+
+    def test_edit_title_migrates_key_and_keeps_history(self):
+        # key = sha1(date|title)，改標題必然換 key。關聯資料若不跟著搬，
+        # 稽核歷史（anchor/probe/verdict）與 body 全部斷鏈。
+        self.con.execute('INSERT INTO anchor VALUES(?,?,?,?)',
+                         (self.key, 'symbol', 'FooService', None))
+        self.con.execute('INSERT INTO probe VALUES(?,?,?,?,?,?,?)',
+                         (1, self.key, 'ALIVE', 1, '[]', '[]', '[]'))
+        self.con.commit()
+        body_before = self._body(self.key)
+
+        new_key = todo_store.edit_title(self.con, self.key, '改過的標題')
+        self.assertNotEqual(new_key, self.key)
+
+        self.assertEqual(self._body(new_key), body_before, 'body 沒跟著搬')
+        self.assertEqual(self.con.execute(
+            'SELECT COUNT(*) FROM anchor WHERE todo_key=?',
+            (new_key,)).fetchone()[0], 1, 'anchor 沒跟著搬')
+        self.assertEqual(self.con.execute(
+            'SELECT COUNT(*) FROM probe WHERE todo_key=?',
+            (new_key,)).fetchone()[0], 1, 'probe 沒跟著搬')
+        # 舊 key 不得殘留
+        self.assertEqual(self.con.execute(
+            'SELECT COUNT(*) FROM todo WHERE key=?',
+            (self.key,)).fetchone()[0], 0)
+
+    def test_edit_title_keeps_date_prefix(self):
+        new_key = todo_store.edit_title(self.con, self.key, '改過的標題')
+        title, raw = self.con.execute(
+            'SELECT title, raw_title FROM todo WHERE key=?', (new_key,)).fetchone()
+        self.assertTrue(title.startswith('[2026-08-08]'), f'日期前綴掉了: {title}')
+        self.assertTrue(raw.startswith('- [ ] [2026-08-08]'))
+        self.assertTrue(raw.endswith('改過的標題'))
+
+    def test_edit_title_keeps_heading_priority(self):
+        # 條目在 `## 🔴 立即處理` 底下，改標題加 [P2] 不該把它拉走 ——
+        # heading 優先於標題標記是刻意設計（見 _section_of 的 docstring）
+        new_key = todo_store.edit_title(self.con, self.key, '[P2] 降級了')
+        sec = self.con.execute('SELECT section FROM todo WHERE key=?',
+                               (new_key,)).fetchone()[0]
+        self.assertEqual(sec, 'urgent')
+
+    def test_edit_title_recomputes_section_without_heading(self):
+        # 無 heading 時才由標題標記決定
+        con2 = todo_store.connect(Path(self.tmp.name) / 'u.sqlite')
+        todo_store.save_parsed(con2, 'd', todo_store.parse_md_lossless(
+            '- [ ] [2026-08-08] [P0] 無章節\n  > 💡  x\n'))
+        k = con2.execute('SELECT key FROM todo').fetchone()[0]
+        self.assertEqual(con2.execute(
+            'SELECT section FROM todo WHERE key=?', (k,)).fetchone()[0], 'urgent')
+        nk = todo_store.edit_title(con2, k, '[P2] 降級了')
+        self.assertEqual(con2.execute(
+            'SELECT section FROM todo WHERE key=?', (nk,)).fetchone()[0], 'later')
+        con2.close()
+
+    def test_edit_line_replaces_content(self):
+        todo_store.edit_line(self.con, self.key, 1, '🏷️  改過的 tag')
+        self.assertEqual(self._body(self.key)[1], '  > 🏷️  改過的 tag')
+
+    def test_edit_line_rejects_out_of_range(self):
+        with self.assertRaises(IndexError):
+            todo_store.edit_line(self.con, self.key, 99, '🏷️  x')
+
+    def test_remove_line(self):
+        before = self._body(self.key)
+        todo_store.remove_line(self.con, self.key, 0)
+        after = self._body(self.key)
+        self.assertEqual(len(after), len(before) - 1)
+        self.assertNotIn(before[0], after)
+
+    def test_remove_item_deletes_all_related_rows(self):
+        self.con.execute('INSERT INTO anchor VALUES(?,?,?,?)',
+                         (self.key, 'symbol', 'FooService', None))
+        self.con.execute('INSERT INTO probe VALUES(?,?,?,?,?,?,?)',
+                         (1, self.key, 'ALIVE', 1, '[]', '[]', '[]'))
+        self.con.commit()
+        todo_store.remove_item(self.con, self.key)
+        for tbl in ('todo', 'todo_line', 'anchor', 'probe', 'verdict'):
+            n = self.con.execute(
+                f'SELECT COUNT(*) FROM {tbl} WHERE '
+                + ('key=?' if tbl == 'todo' else 'todo_key=?'),
+                (self.key,)).fetchone()[0]
+            self.assertEqual(n, 0, f'{tbl} 有殘留')
+
+
+class TestClaimGuard(unittest.TestCase):
+    """認領守衛：擋掉「B session 覆蓋 A 正在做的條目」。
+
+    守衛條件是「當前是他人的 doing」，不是「本次要寫 doing」——
+    B 把 A 的 doing 直接標 done 比重複認領更糟：A 還在做，條目已消失。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.con = todo_store.connect(Path(self.tmp.name) / 't.sqlite')
+        todo_store.save_parsed(self.con, 'demo',
+                               todo_store.parse_md_lossless(SAMPLE))
+        self.key = self.con.execute(
+            'SELECT key FROM todo ORDER BY sort_order').fetchone()[0]
+
+    def tearDown(self):
+        self.con.close()
+        self.tmp.cleanup()
+
+    def test_doing_requires_explicit_owner(self):
+        # 沒有身分的認領無法防撞車 —— 全部 session 都叫同一個名字等於沒有名字
+        with self.assertRaises(ValueError) as cm:
+            todo_store.set_status(self.con, self.key, 'doing', by=None)
+        self.assertIn('by', str(cm.exception).lower())
+
+    def test_other_session_cannot_overwrite_doing(self):
+        todo_store.set_status(self.con, self.key, 'doing', by='sess-a')
+        with self.assertRaises(todo_store.ClaimConflict):
+            todo_store.set_status(self.con, self.key, 'doing', by='sess-b')
+
+    def test_other_session_cannot_mark_someone_elses_doing_as_done(self):
+        # 最危險的一種：A 還在做，B 把條目標完成，A 的工作從清單上消失
+        todo_store.set_status(self.con, self.key, 'doing', by='sess-a')
+        with self.assertRaises(todo_store.ClaimConflict):
+            todo_store.set_status(self.con, self.key, 'done', by='sess-b')
+
+    def test_same_owner_may_re_mark(self):
+        # 續作、或同一 session 重跑，不該被自己的鎖擋住
+        todo_store.set_status(self.con, self.key, 'doing', by='sess-a')
+        todo_store.set_status(self.con, self.key, 'doing', by='sess-a')
+        todo_store.set_status(self.con, self.key, 'done', by='sess-a')
+        self.assertEqual(self._status(), 'done')
+
+    def test_force_overrides_and_is_recorded(self):
+        todo_store.set_status(self.con, self.key, 'doing', by='sess-a')
+        todo_store.set_status(self.con, self.key, 'doing', by='sess-b',
+                              force=True)
+        row = self.con.execute('SELECT status_by FROM todo WHERE key=?',
+                               (self.key,)).fetchone()
+        self.assertEqual(row[0], 'sess-b')
+
+    def test_unowned_doing_is_still_guarded(self):
+        # status_by 為 NULL 的 doing（舊資料）：「有人在做但不知是誰」
+        # 比「沒人做」更危險，一樣要擋，由人用 --force 裁決
+        self.con.execute("UPDATE todo SET status='doing', status_by=NULL"
+                         " WHERE key=?", (self.key,))
+        self.con.commit()
+        with self.assertRaises(todo_store.ClaimConflict):
+            todo_store.set_status(self.con, self.key, 'doing', by='sess-b')
+
+    def test_conflict_message_names_owner_and_time(self):
+        # 訊息要能讓人當場判斷「該不該搶」—— 缺任一項都判斷不了
+        todo_store.set_status(self.con, self.key, 'doing', by='sess-a')
+        with self.assertRaises(todo_store.ClaimConflict) as cm:
+            todo_store.set_status(self.con, self.key, 'done', by='sess-b')
+        msg = str(cm.exception)
+        self.assertIn('sess-a', msg)
+        self.assertIn('force', msg)
+
+    def test_release_clears_owner(self):
+        # 標回 pending = 釋放。留著舊 status_by 會讓消費端分不出
+        # 「現任擁有者」與「上一個做過的人」
+        todo_store.set_status(self.con, self.key, 'doing', by='sess-a')
+        todo_store.set_status(self.con, self.key, 'pending', by='sess-a')
+        row = self.con.execute('SELECT status_by, status_at FROM todo'
+                               ' WHERE key=?', (self.key,)).fetchone()
+        self.assertIsNone(row[0])
+        self.assertIsNotNone(row[1], 'status_at 要留著 —— 它是「何時釋放」')
+
+    def test_released_item_is_claimable_again(self):
+        todo_store.set_status(self.con, self.key, 'doing', by='sess-a')
+        todo_store.set_status(self.con, self.key, 'pending', by='sess-a')
+        todo_store.set_status(self.con, self.key, 'doing', by='sess-b')
+        self.assertEqual(self._status(), 'doing')
+
+    def test_pending_item_is_free_to_claim(self):
+        todo_store.set_status(self.con, self.key, 'doing', by='sess-b')
+        self.assertEqual(self._status(), 'doing')
+
+    def _status(self):
+        return self.con.execute('SELECT status FROM todo WHERE key=?',
+                                (self.key,)).fetchone()[0]
+
+
+class TestMigrateTargets(unittest.TestCase):
+    def test_view_mirror_is_not_treated_as_a_project(self):
+        # 鏡像是 DB 的衍生物；當成來源會建出內容是自己衍生物的垃圾 DB
+        import migrate_md_to_db
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)
+            (p / 'proj.md').write_text('x', encoding='utf-8')
+            (p / 'proj.view.md').write_text('y', encoding='utf-8')
+            self.assertEqual(migrate_md_to_db.discover_targets(p), ['proj'])
+
+
+if __name__ == '__main__':
+    unittest.main()

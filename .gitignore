@@ -1,0 +1,54 @@
+# ─────────────────────────────────────────────────────────────
+# 這是 PUBLIC repo。本檔的職責是「擋住私密資料」，不是「整理雜物」。
+# 新增規則前先問：這東西外流會怎樣？答案不是「無所謂」就往上放。
+# ─────────────────────────────────────────────────────────────
+
+# ── 待辦資料本體（最高優先，絕不可外流）──
+# 待辦內文含各專案的檔案路徑、架構細節、未修漏洞、策略邏輯。
+# 真相來源是 ~/.claude/todos/.audit/{project}.sqlite，本 repo 只版控「工具」。
+# 用副檔名擋而非目錄名擋 —— 資料就算被誤放到任何子目錄也照樣攔下。
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.view.md
+todos/
+.audit/
+
+# ── 稽核與遷移過程的快照 ──
+# 這些是 md→sqlite 遷移期間的備份，內容等同待辦全文。
+*-pre-migrate-*.md
+*-pre-cleanup-*.md
+*-pre-decision-*.md
+*-pre-fix-*.md
+*-pre-item*-*.md
+*-backup-*.md
+pre-migration-*/
+skill-snapshot-*/
+
+# ── Claude Code session 產物 ──
+# .remember/ 是對話歷史緩衝，含 session 全文對話。
+# 它自帶 .gitignore，這裡再擋一次做雙保險（自帶的那份若被誤刪就沒防線了）。
+.remember/
+.claude/
+
+# ── 備份檔 ──
+# 原 ~/.claude/ 裡有 todo-add.sh.bak-20260808-164534 這類檔案。
+# 版控之後就不該再靠 .bak 保存歷史 —— 那是 git 的工作。
+*.bak
+*.bak-*
+*-*.bak
+*.orig
+*.rej
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# ── macOS ──
+.DS_Store
