@@ -27,6 +27,10 @@ MIGRATIONS = [
     "ALTER TABLE todo ADD COLUMN heading TEXT",
     # 真實 md 行號，供 todo_audit.py 的報告輸出使用
     "ALTER TABLE todo ADD COLUMN md_line INT",
+    # run 級品質旗標：這次稽核的 search_dirs 是否零命中而降級為全 repo 掃描。
+    # 刻意不進 probe.state（見 state_of()）—— 那會讓 freshness() 的
+    # `WHERE state IN ('TOUCHED','PARTIAL_GONE')` 統計靜默失真。
+    "ALTER TABLE run ADD COLUMN degraded INT",
 ]
 
 # 完整 schema。前六張表與 todo_audit.py 的 SCHEMA 定義相同（IF NOT EXISTS，
@@ -37,7 +41,7 @@ BASE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS run(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   started_at TEXT NOT NULL, todo_file TEXT, repo TEXT,
-  todo_count INT, symbol_count INT, hit_rate REAL);
+  todo_count INT, symbol_count INT, hit_rate REAL, degraded INT);
 CREATE TABLE IF NOT EXISTS todo(
   key TEXT PRIMARY KEY, date TEXT, title TEXT,
   first_seen_run INT, last_seen_run INT, content_hash TEXT);
@@ -364,10 +368,17 @@ def freshness(con):
 
 
 def state_of(con, key):
+    """顯示層狀態。`probe.state` 一律是 `classify()` 的真值 ——
+    降級（WEAK_AUDIT）記在 run 級，這裡才依 run.degraded 做顯示取代，
+    不覆蓋 probe 本身，否則 freshness() 的統計會靜默失真。"""
     row = con.execute(
-        'SELECT state FROM probe WHERE todo_key=? ORDER BY run_id DESC LIMIT 1',
+        'SELECT p.state, r.degraded FROM probe p JOIN run r ON r.id = p.run_id'
+        ' WHERE p.todo_key=? ORDER BY p.run_id DESC LIMIT 1',
         (key,)).fetchone()
-    return row[0] if row else 'NO_AUDIT'
+    if row is None:
+        return 'NO_AUDIT'
+    state, degraded = row
+    return 'WEAK_AUDIT' if degraded else state
 
 
 def resolve_ref(con, ref):

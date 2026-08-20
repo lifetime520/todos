@@ -16,6 +16,9 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import todo_config
+
 # ── anchor 抽取規則 ────────────────────────────────────────────────
 # file:line —— 最強的錨點，同時給出存在性與位置
 RE_FILE_LINE = re.compile(
@@ -42,7 +45,10 @@ RE_BACKTICK = re.compile(r'`([A-Za-z_][A-Za-z0-9_]{3,})`')
 # （否則 0.07786353 這種價格數字會被當成 commit）
 RE_COMMIT = re.compile(r'(?<![0-9a-zA-Z.])([0-9a-f]{7,10})(?![0-9a-zA-Z.])')
 
-# 掃描範圍：只看生產與前端原始碼
+# 掃描範圍：只看生產與前端原始碼。
+# 這兩個值現在是 builtin 層 —— 沒有任何 config 檔時逐字沿用（BTSE 零回歸保護）；
+# 專案可用 <repo>/.claude/todo-audit.json 或 ~/.claude/todo-audit.json 覆寫
+# （見 todo_config.load_config()）。值本身一字不改。
 SEARCH_DIRS = ['agent/src/main', 'core/src/main', 'exchange/src/main', 'web/src', 'web/scripts', 'scripts']
 SCAN_EXTS = {'.java', '.ts', '.tsx', '.js', '.mjs', '.cjs', '.sql', '.gradle', '.css', '.sh', '.properties'}
 SKIP_DIRS = {'build', 'node_modules', '.git', 'dist', 'target', 'keyConfig'}
@@ -72,7 +78,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS run(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   started_at TEXT NOT NULL, todo_file TEXT, repo TEXT,
-  todo_count INT, symbol_count INT, hit_rate REAL);
+  todo_count INT, symbol_count INT, hit_rate REAL, degraded INT);
 
 -- key 用 date+title 的 hash，不用行號：行號每次編輯都會漂，
 -- 但標題改了本來就該視為新條目。
@@ -110,14 +116,27 @@ def todo_key(t):
     return hashlib.sha1(f"{t['date']}|{t['title']}".encode()).hexdigest()[:16]
 
 
-def persist(db_path, todo_file, repo, todos, results, symbols, hit_rate, started_at):
-    """寫入 sqlite。回傳 (run_id, 內容有變動的條目數)。"""
+def persist(db_path, todo_file, repo, todos, results, symbols, hit_rate, started_at,
+            degraded=False):
+    """寫入 sqlite。回傳 (run_id, 內容有變動的條目數)。
+
+    `degraded`：這次稽核的 search_dirs 是否零命中而降級為全 repo 掃描（run 級旗標，
+    見 todo_store.state_of()）。既有 DB（建於本欄位新增之前）走 ALTER TABLE
+    就地升級 —— 與 todo_store.MIGRATIONS 的機制一致，供 todo_store.connect()
+    開啟同一個 DB 時不需要重新遷移。
+    """
     con = sqlite3.connect(db_path)
     con.executescript(SCHEMA)
+    try:
+        con.execute('ALTER TABLE run ADD COLUMN degraded INT')
+    except sqlite3.OperationalError as e:
+        if 'duplicate column name' not in str(e):
+            raise
     cur = con.cursor()
-    cur.execute('INSERT INTO run(started_at,todo_file,repo,todo_count,symbol_count,hit_rate)'
-                ' VALUES(?,?,?,?,?,?)',
-                (started_at, str(todo_file), str(repo), len(todos), len(symbols), hit_rate))
+    cur.execute('INSERT INTO run(started_at,todo_file,repo,todo_count,symbol_count,hit_rate,degraded)'
+                ' VALUES(?,?,?,?,?,?,?)',
+                (started_at, str(todo_file), str(repo), len(todos), len(symbols), hit_rate,
+                 1 if degraded else 0))
     run_id = cur.lastrowid
 
     changed = 0
@@ -252,29 +271,63 @@ def extract_anchors(todo):
     return a
 
 
-def collect_source_files(repo):
+def collect_source_files(repo, config=None):
     """一次走訪全 repo，建立兩個用途不同的索引。
 
     兩者的範圍刻意不同 —— 這是實測踩出來的：
     - by_name（檔案存在性）必須涵蓋全 repo。build.gradle 在 root、*Test.java 在
       src/test，若只掃 src/main 會把它們判成「檔案已消失」。
-    - files（符號掃描）只看生產碼。把測試碼算進來的話，「符號只剩測試在用、
+    - files（符號掃描）只看生產碼，範圍由三層 config 合併後的 search_dirs/scan_exts
+      決定（見 todo_config.load_config()）。把測試碼算進來的話，「符號只剩測試在用、
       生產零呼叫端」這種死碼特徵就驗不出來 —— 而那正是本 repo 反覆出現的缺陷型態。
 
     索引只建一次。原本每條 todo 各跑一次 rglob，198 條就是 198 次全樹遍歷。
+
+    `config` 由呼叫端（main()）預先合併好傳入，避免每次呼叫都重新讀一次
+    config 檔；未傳入時（例如單元測試直接呼叫本函式）就地合併一次。
     """
+    if config is None:
+        defaults = {'search_dirs': list(SEARCH_DIRS), 'scan_exts': list(SCAN_EXTS)}
+        config, _ = todo_config.load_config(repo, defaults)
+    search_dirs = config['search_dirs']
+    scan_exts = set(config['scan_exts'])
+
     prod_files, by_name = [], defaultdict(list)
-    prod_roots = tuple(str(repo / d) for d in SEARCH_DIRS)
+    prod_roots = tuple(str(repo / d) for d in search_dirs)
     for p in repo.rglob('*'):
         if not p.is_file() or SKIP_DIRS & set(p.parts):
             continue
         by_name[p.name].append(p)   # 僅記路徑，供存在性判定，不讀內容
         if is_secret(p):
             continue                # 機敏檔永不進入會被 read_text 的清單
-        if p.suffix in SCAN_EXTS and str(p).startswith(prod_roots):
+        if p.suffix in scan_exts and str(p).startswith(prod_roots):
             prod_files.append(p)
     return prod_files, by_name
 
+
+
+def _warn_zero_hit_degrade(repo, config, provenance):
+    """REQ-2 零命中降級警告。訊息依 G-2 區分兩種前因，修復動作不同：
+      (a) 找不到任何 config 檔 → 印「未設定」，指引為「建立 config」
+      (b) config 檔存在但合併後仍零命中 → 不印「未設定」，
+          改印實際生效的 search_dirs 值與其來源層級，指引為「檢查 config 內容」
+
+    判定規則本身在 todo_config.zero_hit_diagnosis()（與 todo_cli.py 的
+    doctor 共用，不各自重做一份〔finding 3〕），這裡只負責用自己的
+    前綴／文案格式化輸出。
+    """
+    diag = todo_config.zero_hit_diagnosis(repo, config, provenance)
+    print('⚠️  WEAK_AUDIT：search_dirs 零命中，已降級為全 repo 掃描 —— '
+          '死碼偵測（GONE 判定）本次失效，結果不可盡信。')
+    if diag['configured']:
+        print(f'   目前生效的 search_dirs = {diag["search_dirs"]}'
+              f'（來源：{diag["source"]}）')
+        print(f'   請檢查設定內容是否正確：{diag["per_repo_path"]} 或 {diag["user_global_path"]}')
+    else:
+        print(f'   本專案未設定 search_dirs（找不到 {diag["per_repo_path"]} 或 {diag["user_global_path"]}）')
+        print(f'   建立設定檔以縮小掃描範圍，例如 {diag["per_repo_path"]}：')
+        print(f'   {json.dumps(diag["example"])}')
+    print()
 
 
 def build_commit_pool(repo, since):
@@ -926,9 +979,15 @@ def main():
     todos = load_todos(todo_path)
     all_anchors = [extract_anchors(t) for t in todos]
 
-    files, by_name = collect_source_files(repo)
-    if not files:
-        sys.exit(f'FATAL: {repo} 下找不到任何可掃描原始碼；請確認 repo 路徑正確')
+    defaults = {'search_dirs': list(SEARCH_DIRS), 'scan_exts': list(SCAN_EXTS)}
+    config, provenance = todo_config.load_config(repo, defaults)
+    files, by_name = collect_source_files(repo, config)
+    # REQ-2：search_dirs 零命中不再 sys.exit FATAL —— 改為降級掃全 repo，
+    # 並全程標記為 WEAK_AUDIT（run 級旗標，見 persist()/todo_store.state_of()）。
+    degraded = not files
+    if degraded:
+        _warn_zero_hit_degrade(repo, config, provenance)
+        files, by_name = collect_source_files(repo, dict(config, search_dirs=['']))
 
     symbols = {s for a in all_anchors for s in a['symbol']}
     sym_index = build_symbol_index(symbols, files)
@@ -937,8 +996,15 @@ def main():
     # 那會讓一整批仍然成立的條目被判成「載體已消失、可移除」。
     # 已知案例：rg 在某些環境是 shell function，subprocess 拿到 FileNotFoundError
     # 而被 except 吞掉 → 136 個符號全零命中 → 75 條假陽性 ALL_GONE。
+    #
+    # 降級（degraded）狀態下跳過這個門檻〔finding 1〕：該檢查的語意是
+    # 「掃描層故障」，但降級是 search_dirs 零命中後的已知後果 —— 全 repo
+    # 掃描出的檔案副檔名多半不在 scan_exts 之列（該 repo 本來就不是
+    # BTSE 佈局，才會走到降級），低命中率在這裡是預期結果、已經被
+    # _warn_zero_hit_degrade() 警告過，不是「故障」，用同一道門檻攔截
+    # 會讓 REQ-2 驗收 1（降級後不得 FATAL）失效。
     hit_rate = len(sym_index) / len(symbols) if symbols else 1.0
-    if symbols and hit_rate < 0.30:
+    if not degraded and symbols and hit_rate < 0.30:
         sys.exit(
             f'FATAL: 符號索引命中率僅 {hit_rate:.0%}（{len(sym_index)}/{len(symbols)}），'
             f'掃描了 {len(files)} 個檔案。\n'
@@ -986,7 +1052,7 @@ def main():
         dbp = (Path(sys.argv[sys.argv.index('--db') + 1])
                if '--db' in sys.argv else default_db(repo))
         run_id, changed = persist(dbp, todo_path, repo, todos, results,
-                                  symbols, hit_rate, _now())
+                                  symbols, hit_rate, _now(), degraded=degraded)
         print(f'sqlite → {dbp}  run#{run_id}  內容有變動 {changed} 條\n')
 
     out = None
