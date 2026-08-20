@@ -242,6 +242,49 @@ class TestCliDisplaysWeakAuditTag(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertIn('[WEAK_AUDIT]', r2.stdout)
 
+    def test_todo_cli_show_prefixes_weak_audit(self):
+        # REQ-2 驗收 3（Stage 7 R2 缺口 1）：驗收條文明列 list/show/dump
+        # 三個入口都要顯示 [WEAK_AUDIT]，但 show 先前完全沒有測試覆蓋。
+        # cmd_show（todo_cli.py:88-104）印的是
+        #   f'  {r[0]}  [{todo_store.state_of(con, key)}]  status={r[2]}...'
+        # 同樣走 state_of() 這個顯示層入口，理應在降級 run 後也印出
+        # `[WEAK_AUDIT]`——這裡直接跑一次端到端驗證，不只是讀程式碼推論。
+        env = {'HOME': str(self.home), 'PATH': os.environ.get('PATH', '/usr/bin:/bin:/usr/local/bin')}
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS / 'todo_audit.py'), str(self.md), str(self.repo)],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, f'零命中不得 FATAL —— stderr:{r.stderr}')
+
+        # ref 用標題子字串即可命中（resolve_ref 支援 title LIKE 比對）
+        r2 = subprocess.run(
+            [sys.executable, str(SCRIPTS / 'todo_cli.py'), 'show', self.title,
+             '--project', 'demoproj'],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertIn('[WEAK_AUDIT]', r2.stdout,
+                      f'show 應在降級 run 後顯示 [WEAK_AUDIT]，實際輸出：\n{r2.stdout}')
+
+    def test_todo_cli_dump_prefixes_weak_audit(self):
+        # REQ-2 驗收 3（Stage 7 R2 缺口 1）：dump 的 md 格式（cmd_dump 預設
+        # format='md'）走的是
+        #   f'\n{sid} [{st}]{claim_tag(...)} {raw}'
+        # 同樣經由 state_of()，理應在降級 run 後印出 [WEAK_AUDIT]。
+        # 注意：dump --format json 印的是 `"state": "WEAK_AUDIT"`（無中括號
+        # 字面量），驗收條文明文要求的是 `[WEAK_AUDIT]` 這個顯示形式，
+        # 所以這裡刻意用預設的 md 格式，不測 json 格式。
+        env = {'HOME': str(self.home), 'PATH': os.environ.get('PATH', '/usr/bin:/bin:/usr/local/bin')}
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS / 'todo_audit.py'), str(self.md), str(self.repo)],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, f'零命中不得 FATAL —— stderr:{r.stderr}')
+
+        r2 = subprocess.run(
+            [sys.executable, str(SCRIPTS / 'todo_cli.py'), 'dump', '--project', 'demoproj'],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertIn('[WEAK_AUDIT]', r2.stdout,
+                      f'dump 應在降級 run 後顯示 [WEAK_AUDIT]，實際輸出：\n{r2.stdout}')
+
 
 class TestClassifyUnaffectedByDegradation(unittest.TestCase):
     """G-6：classify() 的判定邏輯與輸出集合完全不變 —— 純邏輯測試，不需要 repo/git。
@@ -323,6 +366,101 @@ class TestDegradedWithRealSymbolAnchorDoesNotFatal(unittest.TestCase):
                          '降級狀態下低命中率是已知且已被警告過的預期結果，'
                          '不該再被 fail-loud 門檻攔截為故障')
         self.assertIn('WEAK_AUDIT', out, '應仍照常印出降級警告')
+
+
+class TestClassifyIdenticalAcrossDegradation(unittest.TestCase):
+    """REQ-2 驗收 5（G-6），直接比對版本（Stage 7 R2 缺口 2）。
+
+    既有 `TestClassifyUnaffectedByDegradation.test_classify_output_set_is_exactly_six_states`
+    驗的是「六態集合本身沒被降級污染」——那是對 `classify()` 餵合成
+    checks/touches 的單元測試，是集合枚舉，不構成「同一批條目、降級前後
+    直接比對」（驗收條文明文禁止的形式）。本測試不刪不改那條，兩者互補。
+
+    這裡改用 commit 錨點：`todo_audit.py:1015-1021` 建立 `commit_set` 的
+    方式是對整個 git 歷史跑 `git cat-file -e <hash>^{commit}`，完全不經過
+    `collect_source_files()`／不看 `SEARCH_DIRS` 命中與否（讀原始碼確認，
+    與 `verify()` 內 `'state': 'OK' if c in commit_set else 'GONE'`
+    一致）。於是同一個 repo、同一個 commit 錨點、同一條待辦，在
+    「search_dirs 命中」與「search_dirs 零命中而降級」兩次 run 中，
+    `probe.state` 理應逐字相同——這才是「降級前後對同一批條目的輸出
+    逐條相同」的直接證據，不是集合枚舉。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / 'repo'
+        self.home = self.root / 'home'
+        self.home.mkdir()
+        _init_repo(self.repo)
+        (self.repo / 'hooks').mkdir()
+        (self.repo / 'hooks' / 'foo.sh').write_text('#!/bin/sh\necho hi\n', encoding='utf-8')
+        _commit_all(self.repo, 'add hooks')
+        # 取剛剛那個 commit 的 10 碼短 hash：純小寫十六進位、長度落在
+        # RE_COMMIT 要求的 7-10 碼區間（todo_audit.py:46）。
+        r = subprocess.run(['git', 'rev-parse', '--short=10', 'HEAD'],
+                           cwd=self.repo, check=True, capture_output=True, text=True)
+        self.chash = r.stdout.strip()
+
+        self.date = '2026-01-01'
+        self.title = f'修好 commit {self.chash} 之後的問題'
+        self.full_title = f'[{self.date}] {self.title}'
+        self.key = todo_store.todo_key(self.date, self.full_title)
+        self.md = self.root / 'todo.md'
+        _write_md(self.md, self.date, self.title)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _probe_state(self, db):
+        con = todo_store.connect(db)
+        try:
+            row = con.execute(
+                'SELECT state FROM probe WHERE todo_key=? ORDER BY run_id DESC LIMIT 1',
+                (self.key,)).fetchone()
+            self.assertIsNotNone(row, f'{db} 應該留下這條待辦的 probe 記錄')
+            return row[0]
+        finally:
+            con.close()
+
+    def _run_degraded_flag(self, db):
+        con = todo_store.connect(db)
+        try:
+            row = con.execute(
+                'SELECT degraded FROM run ORDER BY id DESC LIMIT 1').fetchone()
+            return bool(row[0]) if row else None
+        finally:
+            con.close()
+
+    def test_commit_anchor_probe_state_identical_before_and_after_degrade(self):
+        # 第一次：非降級 run —— per-repo config 讓 search_dirs 命中 hooks/
+        cfg_dir = self.repo / '.claude'
+        cfg_dir.mkdir()
+        cfg_path = cfg_dir / 'todo-audit.json'
+        cfg_path.write_text(json.dumps({'search_dirs': ['hooks']}), encoding='utf-8')
+        db_hit = self.root / 'hit.sqlite'
+        r1 = run_audit(self.md, self.repo, db_hit, self.home)
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        self.assertFalse(self._run_degraded_flag(db_hit), '此 run 不該是降級狀態')
+        state_hit = self._probe_state(db_hit)
+
+        # 第二次：同一個 repo／同一個 commit／同一條待辦，移除 config，
+        # 讓 search_dirs 回落內建預設 —— 對這個 repo（只有 hooks/）是零命中
+        # → 降級。
+        cfg_path.unlink()
+        db_degraded = self.root / 'degraded.sqlite'
+        r2 = run_audit(self.md, self.repo, db_degraded, self.home)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertTrue(self._run_degraded_flag(db_degraded), '此 run 應該是降級狀態')
+        state_degraded = self._probe_state(db_degraded)
+
+        # G-6：commit_set 的建立與 collect_source_files()／SEARCH_DIRS 無關，
+        # 所以同一個 commit 錨點的 classify() 判定不受降級影響 —— 逐條相同。
+        self.assertEqual(state_hit, state_degraded,
+                         'commit 錨點的 probe.state 在降級前後應逐條相同（G-6），'
+                         f'實際：命中 run={state_hit!r}，降級 run={state_degraded!r}')
+        self.assertEqual(state_hit, 'ALIVE',
+                         'commit 存在、無其他 GONE 訊號、無 touches，理應判 ALIVE')
 
 
 if __name__ == '__main__':

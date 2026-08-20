@@ -432,5 +432,42 @@ class TestDoctorDegradedState(unittest.TestCase):
                           '兩邊都被踩過而非誤判為同一條路徑）')
 
 
+class TestDoctorDbExistsHappyPath(unittest.TestCase):
+    """REQ-3「DB 是否存在」涵蓋項（Stage 7 R2 缺口 3）。
+
+    既有測試只斷言過負面情況：`TestDoctorMissingDb`（DB 不存在 → FAIL）與
+    `TestDoctorCorruptDb`（DB 損毀 → FAIL）。DB 正常存在時的那行
+    `OK   DB 存在：{db}`（todo_cli.py:291）從未被任何測試斷言過——
+    `TestDoctorHappyPath` 等測試雖然也用了正常的 DB，但只斷言
+    search_dirs／provenance 相關的行，沒人讀過這一行本身的前綴與內容。
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        tmp = Path(self._tmpdir.name)
+        self.home = tmp / 'home'
+        self.repo = tmp / 'repo'
+        self.repo.mkdir(parents=True)
+        self.db = _init_db(self.home, 'demo')
+
+    def test_db_exists_reports_ok_line_with_db_path(self):
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = r.stdout + r.stderr
+        db_lines = [l for l in out.splitlines() if 'DB 存在' in l]
+        self.assertTrue(db_lines,
+                        f'DB 正常存在時應有一行「DB 存在」訊息，實際找不到：\n{out}')
+        line = db_lines[0]
+        self.assertEqual(PREFIX_RE.match(line).group(1), 'OK',
+                          f'DB 存在時該行應為 OK 前綴，實際：{line}')
+        self.assertIn(str(self.db), line,
+                      f'該行應帶出實際 DB 路徑：{line}')
+        # 與負面情況（FAIL：不存在／損毀）互斥，證明這是不同的分支
+        self.assertNotIn('FAIL', line)
+
+
 if __name__ == '__main__':
     unittest.main()
