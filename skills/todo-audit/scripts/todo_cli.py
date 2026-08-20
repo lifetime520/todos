@@ -523,7 +523,14 @@ def main():
     else:
         con = todo_store.connect(db)
     try:
-        if args.path:
+        # doctor 的第四種豁免：bind_project() 檢查跳過。doctor 繼承了
+        # common parser 的 --path/--remote，若使用者對一個已綁定到別處的
+        # project 名跑 `doctor --path <另一路徑>`，bind_project() 會拋
+        # ProjectBindingConflict，診斷還沒開始就被下面的 except 攔截、
+        # exit=6、零診斷輸出——這正是 doctor 存在的理由要避免的失效模式：
+        # 自我診斷工具不該因為別的安全檢查而自己先跑不起來（Stage 7 第三輪
+        # 用戶裁決）。其餘指令仍照常走綁定檢查。
+        if args.path and args.cmd != 'doctor':
             todo_store.bind_project(con, project, args.path, args.remote)
         rc = args.fn(con, args)
         return rc or 0

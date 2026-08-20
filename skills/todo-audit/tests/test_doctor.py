@@ -469,5 +469,156 @@ class TestDoctorDbExistsHappyPath(unittest.TestCase):
         self.assertNotIn('FAIL', line)
 
 
+class TestDoctorBypassesBindProjectConflict(unittest.TestCase):
+    """Stage 7 第三輪裁決（requirements.md「Stage 7 第三輪裁決記錄」）：
+    doctor 繞過 bind_project() 檢查（REQ-3 驗收 5，新增）。
+
+    doctor 繼承 common parser 的 --path/--remote，main() 在把控制權交給
+    cmd_doctor 之前，會無條件呼叫 todo_store.bind_project()。若對一個
+    已綁定到路徑 A 的 project 名跑 `doctor --path <路徑 B>`，
+    bind_project() 會拋 ProjectBindingConflict，main() 既有的
+    except todo_store.ProjectBindingConflict 分支會印出綁定衝突錯誤、
+    exit=6——cmd_doctor 一行都沒機會執行，doctor 存在的目的（自我診斷）
+    在這條路徑上完全失效，違反 REQ-3「exit code 恆為 0」。
+
+    用戶裁決：doctor 是診斷工具，不應該因為別的安全檢查而自己先跑不起來，
+    故 doctor 繞過 bind_project() 檢查；其餘指令仍照常走綁定檢查
+    （不在本檔測試範圍，因為改動只動 doctor 這一條分支）。
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        tmp = Path(self._tmpdir.name)
+        self.home = tmp / 'home'
+        self.repo_a = tmp / 'repo_a'
+        self.repo_b = tmp / 'repo_b'
+        self.repo_a.mkdir(parents=True)
+        self.repo_b.mkdir(parents=True)
+        self.db = _init_db(self.home, 'demo')
+        # 先把 'demo' 綁定到 repo_a，模擬既有專案已綁定到別處
+        # （寫法沿用 todo_store.bind_project 本身的簽名，與
+        # todo_store.py:509 的 docstring 範例一致）。
+        con = todo_store.connect(self.db)
+        todo_store.bind_project(con, 'demo', str(self.repo_a), '(no-remote)')
+        con.close()
+
+    def test_conflicting_path_still_exits_zero_with_diagnostics(self):
+        # 對同一個 project 名跑 doctor，但 --path 指向另一個路徑（repo_b）
+        # ——這正是 bind_project() 會拋 ProjectBindingConflict 的條件。
+        r = run_cli('doctor', '--project', 'demo', '--path', str(self.repo_b),
+                    env_home=self.home, cwd=self.repo_b)
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0,
+                         f'doctor 遇到綁定衝突仍須 exit 0，不得提前中止：\n{out}')
+        self.assertNotIn('❌', out,
+                         f'doctor 不該因綁定衝突印出 main() 既有的錯誤訊息：\n{out}')
+        self.assertNotIn('不能共用待辦', out,
+                         f'doctor 輸出不該含 ProjectBindingConflict 的錯誤文字：\n{out}')
+        # 必須真的跑到 cmd_doctor：照常印出 project=/path= 那一行診斷內容
+        project_lines = [l for l in out.splitlines() if 'project=' in l]
+        self.assertTrue(project_lines,
+                        f'doctor 必須照常印出診斷輸出（不得因綁定衝突而零輸出）：\n{out}')
+        self.assertEqual(PREFIX_RE.match(project_lines[0]).group(1), 'OK',
+                         f'project 名/路徑行應為 OK 前綴：{project_lines[0]}')
+        self.assertIn('project=demo', project_lines[0])
+        self.assertIn(f'path={self.repo_b}', project_lines[0])
+
+    def test_conflicting_path_reports_multiple_diagnostic_lines(self):
+        # 不只驗證單一行存在，還要確認整段診斷邏輯（DB 存在性、稽核新鮮度、
+        # search_dirs 等）都有跑完，而不是提前在某個中間點被截斷。
+        r = run_cli('doctor', '--project', 'demo', '--path', str(self.repo_b),
+                    env_home=self.home, cwd=self.repo_b)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = r.stdout + r.stderr
+        prefixed = [l for l in out.splitlines() if PREFIX_RE.match(l)]
+        self.assertGreaterEqual(len(prefixed), 3,
+                                f'綁定衝突下 doctor 的診斷行數不該比正常路徑少：\n{out}')
+
+
+class TestDoctorAuditRecencyFormat(unittest.TestCase):
+    """Stage 7 第三輪裁決（requirements.md「Stage 7 第三輪裁決記錄」）
+    REQ-3『距今多久』涵蓋項的驗收判準補充：既有的
+    `TestDoctorAuditRecency` 只斷言了『從未』字樣的有/無
+    （test_never_audited_reported_distinctly /
+    test_has_run_is_not_reported_as_never_audited），從未真正構造一個
+    『已知時間差』的 run 紀錄去斷言 todo_cli.py:296-298 那段
+    `X 小時前`/`X 天前` 格式化邏輯本身的輸出內容是否正確反映了實際
+    經過時間，也沒驗過 48 小時的單位切換門檻（`age < 48` 用小時，
+    否則用天）真的生效。本 class 直接寫入一個帶已知過去 `started_at`
+    的 run，驗證：
+      1. 3 小時前的紀錄 → 印出「3 小時前」（小時分支，且不誤入天分支）
+      2. 72 小時（3 天）前的紀錄 → 印出「3 天前」，不是「72 小時前」
+      3. 49 小時前的紀錄（剛超過 48 小時門檻）→ 印出「2 天前」而非
+         小時，證明門檻本身（不只是格式字串）確實在 48 這個值上切換
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        tmp = Path(self._tmpdir.name)
+        self.home = tmp / 'home'
+        self.repo = tmp / 'repo'
+        self.repo.mkdir(parents=True)
+        self.db = _init_db(self.home, 'demo')
+
+    def _insert_run_started_hours_ago(self, hours_ago):
+        # started_at 直接寫成 Python 算好的過去時間點（與 todo_store.py
+        # freshness() 的 `datetime.now() - datetime.fromisoformat(started)`
+        # 用同一套 naive local clock，不透過 SQLite 的 datetime('now')
+        # ——後者是 UTC，混用會讓時間差失去確定性，測不出精確的『距今多久』）。
+        import datetime as dt
+        started = (dt.datetime.now() - dt.timedelta(hours=hours_ago)).isoformat(sep=' ')
+        con = todo_store.connect(self.db)
+        con.execute(
+            "INSERT INTO run(started_at, todo_file, repo, todo_count,"
+            " symbol_count, hit_rate) VALUES(?, '', ?, 0, 0, 1.0)",
+            (started, str(self.repo)))
+        con.commit()
+        con.close()
+
+    def _recency_line(self, out):
+        lines = [l for l in out.splitlines() if '上次稽核' in l and 'OK' in l]
+        self.assertTrue(lines, f'找不到「上次稽核」那行 OK 訊息：\n{out}')
+        return lines[0]
+
+    def test_three_hours_ago_reports_hour_unit_with_correct_count(self):
+        self._insert_run_started_hours_ago(3)
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        line = self._recency_line(r.stdout + r.stderr)
+        self.assertIn('3 小時前', line,
+                       f'3 小時前的 run 應格式化為「3 小時前」，實際：{line}')
+        self.assertNotIn('天前', line,
+                          f'3 小時前不該被誤判進天數分支：{line}')
+
+    def test_seventy_two_hours_ago_reports_day_unit_not_hour_unit(self):
+        self._insert_run_started_hours_ago(72)
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        line = self._recency_line(r.stdout + r.stderr)
+        self.assertIn('3 天前', line,
+                       f'72 小時（3 天）前的 run 應格式化為「3 天前」，實際：{line}')
+        self.assertNotIn('72 小時前', line,
+                          f'超過 48 小時門檻不該仍用小時單位：{line}')
+
+    def test_just_over_48_hour_threshold_switches_to_day_unit(self):
+        # 49 小時：剛超過 age<48 的門檻，驗證切換點本身（不是任意大數字
+        # 才切換），round(49/24)=2 → 應印「2 天前」。
+        self._insert_run_started_hours_ago(49)
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        line = self._recency_line(r.stdout + r.stderr)
+        self.assertIn('2 天前', line,
+                       f'49 小時前應剛好切換到天單位並顯示「2 天前」，實際：{line}')
+        self.assertNotIn('小時前', line,
+                          f'超過 48 小時門檻不該仍落在小時分支：{line}')
+
+
 if __name__ == '__main__':
     unittest.main()
