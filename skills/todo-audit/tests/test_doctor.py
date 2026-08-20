@@ -337,5 +337,100 @@ class TestDoctorAuditRecency(unittest.TestCase):
         self.assertNotIn('從未', r.stdout + r.stderr)
 
 
+class TestDoctorProjectNameAndPath(unittest.TestCase):
+    """至少涵蓋：解析出的 project 名與路徑（requirements.md REQ-3 條列
+    第一點）。Stage 7 驗收發現 todo_cli.py:284 已經印出
+    `OK   project=<name>  path=<repo>` 這一行，但既有測試只用
+    `test_output_lines_are_grep_friendly_and_colorless` 斷言前綴行數，
+    從未斷言這一行本身的內容——`grep 'project='` 在既有測試裡零命中。
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        tmp = Path(self._tmpdir.name)
+        self.home = tmp / 'home'
+        self.repo = tmp / 'repo'
+        self.repo.mkdir(parents=True)
+        _init_db(self.home, 'demo')
+
+    def test_reports_ok_line_with_project_name_and_repo_path(self):
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = r.stdout + r.stderr
+        project_lines = [l for l in out.splitlines() if 'project=' in l]
+        self.assertTrue(project_lines,
+                        f'找不到含 project= 的行（REQ-3「解析出的 project 名與'
+                        f'路徑」無測試覆蓋）：\n{out}')
+        line = project_lines[0]
+        self.assertEqual(PREFIX_RE.match(line).group(1), 'OK',
+                          f'project 名/路徑行應為 OK 前綴：{line}')
+        self.assertIn('project=demo', line, f'未印出實際 project 名：{line}')
+        self.assertIn(f'path={self.repo}', line, f'未印出實際 repo 路徑：{line}')
+
+
+class TestDoctorDegradedState(unittest.TestCase):
+    """至少涵蓋：是否處於降級狀態（requirements.md REQ-3 條列第六點）。
+
+    Stage 7 驗收發現 todo_cli.py:299-305 有 `run.degraded` 之後的
+    WARN/OK 分支，但既有測試（TestDoctorAuditRecency）插入的 run 其
+    degraded 一律是 NULL（未指定該欄位），從未走到 degraded=1 的
+    WARN 分支——WARN 分支完全沒被踩過。本 class 分別構造 degraded=1
+    與 degraded=0（顯式非降級）兩種 run，證明兩條分支都被踩到、且
+    互斥（不會同時出現彼此的文字）。
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        tmp = Path(self._tmpdir.name)
+        self.home = tmp / 'home'
+        self.repo = tmp / 'repo'
+        self.repo.mkdir(parents=True)
+        self.db = _init_db(self.home, 'demo')
+
+    def _insert_run(self, degraded):
+        con = todo_store.connect(self.db)
+        con.execute(
+            "INSERT INTO run(started_at, todo_file, repo, todo_count,"
+            " symbol_count, hit_rate, degraded)"
+            " VALUES(datetime('now'), '', ?, 0, 0, 1.0, ?)",
+            (str(self.repo), degraded))
+        con.commit()
+        con.close()
+
+    def test_degraded_run_reports_warn_with_weak_audit_text(self):
+        self._insert_run(1)
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = r.stdout + r.stderr
+        self.assertIn('WEAK_AUDIT 降級狀態', out,
+                       f'run.degraded=1 時應印出降級狀態的 WARN 文字：\n{out}')
+        warn_lines = [l for l in out.splitlines()
+                     if 'WEAK_AUDIT 降級狀態' in l]
+        self.assertTrue(warn_lines and
+                        PREFIX_RE.match(warn_lines[0]) and
+                        PREFIX_RE.match(warn_lines[0]).group(1) == 'WARN',
+                        f'降級狀態那行應為 WARN 前綴：\n{warn_lines}')
+        self.assertNotIn('上次稽核未處於降級狀態', out,
+                          '降級時不該同時出現非降級分支的文字')
+
+    def test_non_degraded_run_reports_ok_without_weak_audit_text(self):
+        self._insert_run(0)
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = r.stdout + r.stderr
+        self.assertIn('上次稽核未處於降級狀態', out,
+                       f'run.degraded=0 時應印出非降級分支的 OK 文字：\n{out}')
+        self.assertNotIn('WEAK_AUDIT 降級狀態', out,
+                          '非降級時不該出現降級分支的 WARN 文字（證明分支互斥、'
+                          '兩邊都被踩過而非誤判為同一條路徑）')
+
+
 if __name__ == '__main__':
     unittest.main()
