@@ -9,6 +9,7 @@
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -257,6 +258,83 @@ def cmd_audit(con, args):
                             str(db_for(args.project_resolved)), '.'])
 
 
+def cmd_doctor(con, args):
+    """自我診斷（REQ-3）。逐行 OK/WARN/FAIL 前綴、純文字無顏色、可 grep，
+    exit code 恆為 0 —— 診斷工具的職責是印出發現，不是自己跑不起來。
+
+    `con` 可能是 None：main() 依 G-3（零寫入副作用）在觸碰
+    `todo_store.connect()` 之前就把「DB 不存在」的案例分流到這裡 ——
+    `connect()` 對不存在的路徑會直接建檔（executescript(BASE_SCHEMA)），
+    這本身就是診斷動作不該有的副作用，所以連呼叫都不能發生。
+
+    「repo root」用執行時的 cwd（與 cmd_audit 把 `'.'` 傳給
+    todo_audit.py 的既有慣例一致），不是靠 `--path` 或往上找 marker。
+
+    search_dirs 的來源層級直接消費 `todo_config.load_config()` 回傳的
+    provenance（'builtin'/'user-global'/'per-repo'，逐字沿用，不翻譯、
+    不自行重做三層探測 —— 兩份合併邏輯遲早分歧）。
+    """
+    import todo_audit
+    import todo_config
+
+    repo = Path.cwd()
+    db = db_for(args.project_resolved)
+    home = Path(os.environ.get('HOME', Path.home()))
+
+    print(f'OK   project={args.project_resolved}  path={repo}')
+
+    if con is None:
+        print(f'FAIL DB 不存在：{db}')
+        print(f'     請先建庫：python3 {Path(__file__).resolve()} init '
+              f'--project {args.project_resolved}')
+    else:
+        print(f'OK   DB 存在：{db}')
+        f = todo_store.freshness(con)
+        if f['last_run'] is None:
+            print('WARN 從未稽核 —— 動工前請跑：todo_cli.py audit')
+        else:
+            age = f['age_hours']
+            when = f'{age:.0f} 小時前' if age < 48 else f'{age / 24:.0f} 天前'
+            print(f'OK   上次稽核 {f["last_run"][:16]}（{when}）')
+            row = con.execute(
+                'SELECT degraded FROM run ORDER BY id DESC LIMIT 1').fetchone()
+            if row and row[0]:
+                print('WARN 上次稽核處於 WEAK_AUDIT 降級狀態 —— '
+                      'search_dirs 零命中，死碼偵測（GONE 判定）當次失效')
+            else:
+                print('OK   上次稽核未處於降級狀態')
+
+    defaults = {'search_dirs': list(todo_audit.SEARCH_DIRS),
+               'scan_exts': list(todo_audit.SCAN_EXTS)}
+    config, provenance = todo_config.load_config(repo, defaults, home=home)
+    files, _by_name = todo_audit.collect_source_files(repo, config)
+    hit_count = len(files)
+    source = provenance.get('search_dirs', 'builtin')
+    # 判定規則（「未設定」vs「設定但零命中」）與 todo_audit.py 的降級警告
+    # 共用同一份實作，不各自重做一份〔finding 3〕。
+    diag = todo_config.zero_hit_diagnosis(repo, config, provenance, home=home)
+
+    if hit_count == 0:
+        print('WARN search_dirs 命中 0 個檔案 —— 死碼偵測（GONE 判定）將失效')
+        if diag['configured']:
+            print(f'     目前生效的 search_dirs = {diag["search_dirs"]}'
+                  f'（來源：{diag["source"]}）')
+            print(f'     請檢查設定內容：{diag["per_repo_path"]} 或 {diag["user_global_path"]}')
+        else:
+            print(f'     本專案未設定 search_dirs'
+                  f'（找不到 {diag["per_repo_path"]} 或 {diag["user_global_path"]}）')
+            print(f'     建立設定檔以縮小掃描範圍，例如 {diag["per_repo_path"]}：')
+            print(f'     {json.dumps(diag["example"])}')
+    else:
+        # REQ-3 明文要求涵蓋「search_dirs 生效值與其來源層級」——
+        # 命中分支先前只印數量與來源，沒印生效值本身，設好 config 之後
+        # 使用者恰恰最需要確認「到底哪幾個目錄生效了」〔finding 2〕。
+        print(f'OK   search_dirs 命中 {hit_count} 個檔案（來源：{source}，'
+              f'生效值：{config["search_dirs"]}）')
+
+    return 0
+
+
 def cmd_init(con, args):
     """為新專案建立待辦庫。**唯一會建庫的指令。**
 
@@ -390,6 +468,11 @@ def main():
                        help='為新專案建立待辦庫（唯一會建庫的指令）')
     p.set_defaults(fn=cmd_init)
 
+    p = sub.add_parser('doctor', parents=[common],
+                       help='自我診斷：DB／search_dirs／稽核新鮮度是否正常'
+                            '（唯讀，零寫入副作用，exit code 恆為 0）')
+    p.set_defaults(fn=cmd_doctor)
+
     args = ap.parse_args()
     # SUPPRESS 的選項沒給時屬性不存在，故一律用 getattr
     project = getattr(args, 'project', None) or Path.cwd().name
@@ -400,7 +483,15 @@ def main():
     # 必須在 connect() 之前快照 —— connect 會把 DB 建出來，
     # 等 cmd_init 拿到 con 時「原本存不存在」已被自己的副作用抹掉。
     args.db_existed = db.exists()
-    # init 是唯一豁免的指令：它的職責就是把「不存在」變成「存在」。
+    # doctor 是第二個豁免的指令，但豁免理由與 init 相反：init 要把
+    # 「不存在」變成「存在」，doctor 只是要**報告**「不存在」，兩者都不能
+    # 被下面這道「找不到 db 就攔下」的關卡擋住——差別在於 doctor 連
+    # connect() 都不能碰（G-3：零寫入副作用，connect() 對不存在的路徑
+    # 會直接建檔），所以必須在碰 connect() 之前就把它送進 cmd_doctor()，
+    # 而不是走下面 init 共用的 `con = todo_store.connect(db)` 那條路。
+    if args.cmd == 'doctor' and not args.db_existed:
+        return cmd_doctor(None, args)
+    # init 是唯一「自動建庫」的指令：它的職責就是把「不存在」變成「存在」。
     # 其餘指令一律擋下而非自動建庫 —— 理由見 cmd_init 的 docstring。
     if args.cmd != 'init' and not args.db_existed:
         print(f'找不到 {db}', file=sys.stderr)
@@ -413,7 +504,24 @@ def main():
         # 只在 init 建目錄：放進 todo_store.connect() 會讓任何一次讀取都
         # 默默造出目錄，繞過「建庫必須是明確意圖」這條規則。
         db.parent.mkdir(parents=True, exist_ok=True)
-    con = todo_store.connect(db)
+    # doctor 的第三種豁免：DB 檔案存在，但不是合法 sqlite（寫入中斷、磁碟
+    # 滿、被 `echo >` 誤覆蓋…）。connect() 對這種檔案會拋
+    # sqlite3.DatabaseError（executescript(BASE_SCHEMA) 踩到壞檔），
+    # 且這個例外不在下面 except 清單裡 —— 一旦漏接就直接 traceback + exit
+    # 1，違反 REQ-3「exit code 恆為 0、不 traceback」。只在 doctor 這裡
+    # 攔，是因為只有 doctor 的職責是「診斷並回報」，其他指令 DB 壞了本來
+    # 就該讓使用者看到真正的失敗，不該被吞掉。
+    if args.cmd == 'doctor':
+        try:
+            con = todo_store.connect(db)
+        except sqlite3.DatabaseError as e:
+            print(f'FAIL DB 檔案損毀（{e}）：{db}')
+            print(f'     請確認檔案完整性，必要時重新 init：'
+                  f'python3 {Path(__file__).resolve()} init '
+                  f'--project {args.project_resolved}')
+            return 0
+    else:
+        con = todo_store.connect(db)
     try:
         if args.path:
             todo_store.bind_project(con, project, args.path, args.remote)
