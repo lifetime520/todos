@@ -118,6 +118,50 @@ class TestLoadConfigLayering(ConfigLayerFixture):
         self.assertEqual(config['search_dirs'], ['from-user-global'])
         self.assertEqual(prov['search_dirs'], 'user-global')
 
+    def test_search_dirs_as_number_layer_invalid_falls_back_to_builtin(self):
+        # Stage 7 第四輪裁決 / REQ-1 驗收 4（新增判準）：search_dirs 不是
+        # list[str]（此例是數字）時，該層視為非法，比照非法 JSON 處理——
+        # 印 WARN、該層失效、其餘層（此處只剩 builtin）照常合併。
+        # 這正是實跑會炸 TypeError 的那個型別。
+        bad = self._write_cfg(self.repo, json.dumps({'search_dirs': 5}))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            config, prov = todo_config.load_config(self.repo, _defaults(), home=self.home)
+        combined = out.getvalue() + err.getvalue()
+        self.assertTrue(combined.strip(), '型別錯誤必須印出可辨識的警告，不得靜默吞掉')
+        self.assertIn(str(bad), combined, '警告應指出是哪個檔案壞掉')
+        self.assertIn('型別', combined, '警告措辭應區分「型別錯誤」與「JSON 語法錯誤」，避免使用者搞混')
+        self.assertEqual(config['search_dirs'], BUILTIN_SEARCH_DIRS)
+        self.assertEqual(prov['search_dirs'], 'builtin')
+
+    def test_search_dirs_as_string_layer_invalid_falls_back_to_builtin(self):
+        # 常見手誤：忘了寫成陣列，寫成裸字串。若不驗型別，這個字串會被
+        # 當可迭代物逐字元展開成 5 個單字元「目錄」，且不 crash——比
+        # crash 更危險的靜默失效，是本次裁決要堵的主要案例。
+        bad = self._write_cfg(self.repo, json.dumps({'search_dirs': 'hooks'}))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            config, prov = todo_config.load_config(self.repo, _defaults(), home=self.home)
+        combined = out.getvalue() + err.getvalue()
+        self.assertTrue(combined.strip(), '型別錯誤必須印出可辨識的警告，不得靜默吞掉')
+        self.assertIn(str(bad), combined)
+        self.assertEqual(config['search_dirs'], BUILTIN_SEARCH_DIRS,
+                          'search_dirs 不得被當成可迭代物逐字元展開，該層必須整層失效')
+        self.assertEqual(prov['search_dirs'], 'builtin')
+
+    def test_scan_exts_list_with_non_string_element_layer_invalid(self):
+        # scan_exts 雖是 list，但元素非字串（例如混進數字）同樣算型別
+        # 錯誤——驗收要求「list 裡每個元素都必須是 str」。
+        bad = self._write_cfg(self.repo, json.dumps({'scan_exts': [1, 2]}))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            config, prov = todo_config.load_config(self.repo, _defaults(), home=self.home)
+        combined = out.getvalue() + err.getvalue()
+        self.assertTrue(combined.strip(), '型別錯誤必須印出可辨識的警告，不得靜默吞掉')
+        self.assertIn(str(bad), combined)
+        self.assertEqual(sorted(config['scan_exts']), sorted(BUILTIN_SCAN_EXTS))
+        self.assertEqual(prov['scan_exts'], 'builtin')
+
     def test_underscore_prefixed_keys_excluded_from_runtime(self):
         # REQ-1 驗收 6：`_` 前綴鍵是文件，merge 時必須被 strip 掉
         self._write_cfg(self.repo, json.dumps({

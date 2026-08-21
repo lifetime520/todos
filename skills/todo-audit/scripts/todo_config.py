@@ -23,6 +23,11 @@ from pathlib import Path
 
 CONFIG_RELPATH = Path('.claude') / 'todo-audit.json'
 
+# Stage 7 第四輪裁決（2026-08-21）：只對這兩個鍵做型別檢查，值必須是
+# list[str]。不建完整 schema 驗證框架 —— 其他未知鍵不受此規則限制，
+# 那是既有的「未知鍵靜默併入」行為，不在本次修復範圍。
+TYPED_LIST_KEYS = ('search_dirs', 'scan_exts')
+
 
 def config_paths(repo_root, home=None):
     """回傳 (per-repo path, user-global path) 這兩個固定位置，不論是否存在。
@@ -35,11 +40,35 @@ def config_paths(repo_root, home=None):
     return Path(repo_root) / CONFIG_RELPATH, home / CONFIG_RELPATH
 
 
+def _typed_key_error(layer):
+    """檢查 TYPED_LIST_KEYS 內的鍵（若存在於這一層）是否為 list[str]。
+
+    回傳 (key, value) 描述第一個型別錯誤的鍵；全部合法則回傳 None。
+    只驗 search_dirs/scan_exts 這兩個鍵 —— 其他未知鍵不受此規則限制，
+    那是既有的「未知鍵靜默併入」行為，這裡刻意不動〔Stage 7 第四輪裁決〕。
+    """
+    for key in TYPED_LIST_KEYS:
+        if key not in layer:
+            continue
+        v = layer[key]
+        if not isinstance(v, list) or not all(isinstance(item, str) for item in v):
+            return key, v
+    return None
+
+
 def _load_layer(path):
     """讀單一層。回傳該層的 dict（已剔除 `_` 前綴鍵），或 None（檔案不存在／非法內容）。
 
     非法內容印出警告（含檔案路徑），但不拋例外 —— 該層當作不存在，
     其餘層照常合併，不得因為一層壞掉就連帶忽略別層。
+
+    「非法內容」涵蓋兩種情況，處理方式統一（都是印 WARN + 回 None，
+    呼叫端 load_config() 不需要知道是哪一種）：
+    - JSON 語法錯誤（原有邏輯）
+    - search_dirs/scan_exts 型別錯誤（Stage 7 第四輪裁決新增）：值必須是
+      list[str]，否則實跑會在下游炸 TypeError（數字）或被當可迭代物
+      逐字元展開（字串），且後者不 crash、doctor 卻誤報 OK——比 crash
+      更危險的靜默失效。
     """
     if not path.exists():
         return None
@@ -52,7 +81,16 @@ def _load_layer(path):
     if not isinstance(raw, dict):
         print(f'WARN: 設定檔 {path} 內容須是 JSON object，已忽略此層', file=sys.stderr)
         return None
-    return {k: v for k, v in raw.items() if not k.startswith('_')}
+    layer = {k: v for k, v in raw.items() if not k.startswith('_')}
+    type_error = _typed_key_error(layer)
+    if type_error is not None:
+        key, value = type_error
+        print(f'WARN: 設定檔 {path} 的 "{key}" 型別錯誤'
+              f'（須為字串陣列 list[str]，實際為 {type(value).__name__}：{value!r}），'
+              f'已忽略此層，其餘層照常生效',
+              file=sys.stderr)
+        return None
+    return layer
 
 
 def load_config(repo_root, defaults, home=None):

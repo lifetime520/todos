@@ -620,5 +620,74 @@ class TestDoctorAuditRecencyFormat(unittest.TestCase):
                           f'超過 48 小時門檻不該仍落在小時分支：{line}')
 
 
+class TestDoctorConfigTypeError(unittest.TestCase):
+    """Stage 7 第四輪裁決 / REQ-3 驗收 3（追加情境）：config 值型別錯誤
+    （例如 search_dirs 是數字而非 list[str]）時，doctor 仍須 exit 0、
+    不 traceback，且**不得印出 OK**（避免靜默回報健康——這是本次裁決
+    要堵的失效模式：字串型的 search_dirs 若不驗型別會被逐字元展開成
+    5 個單字元目錄，doctor 卻誤報 OK）。
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        tmp = Path(self._tmpdir.name)
+        self.home = tmp / 'home'
+        self.repo = tmp / 'repo'
+        self.repo.mkdir(parents=True)
+        # 型別錯誤：search_dirs 應為 list[str]，這裡故意寫成數字——
+        # 對照組（人工手誤最常見的另一種）是裸字串，見下面的 subTest。
+        _write_json(self.repo / '.claude' / 'todo-audit.json',
+                    {'search_dirs': 5})
+        _init_db(self.home, 'demo')
+
+    def test_type_error_config_exits_zero_no_traceback_no_ok_search_dirs(self):
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertNotIn('Traceback', out, f'doctor 不得 crash 印 traceback：\n{out}')
+        ok_search_dirs_lines = [
+            l for l in out.splitlines()
+            if PREFIX_RE.match(l) and PREFIX_RE.match(l).group(1) == 'OK'
+            and ('search_dirs' in l or '命中' in l)]
+        self.assertFalse(ok_search_dirs_lines,
+                          f'search_dirs 型別錯誤時不得印出 OK（靜默回報健康）：\n{ok_search_dirs_lines}')
+
+    def test_string_type_search_dirs_exits_zero_no_traceback_no_ok(self):
+        # 常見手誤：忘了寫成陣列，寫成裸字串 'hooks'。這是不 crash 但
+        # 最危險的情境——字串被當可迭代物逐字元展開，若不驗型別，doctor
+        # 會誤報 OK，使用者完全看不出設定沒生效。
+        _write_json(self.repo / '.claude' / 'todo-audit.json',
+                    {'search_dirs': 'hooks'})
+        # mutation test 補強：這條測試原本恆真（fixture 是空 repo，
+        # collect_source_files() 不論型別檢查存不存在都命中 0 個檔案，
+        # 「不印 OK」永遠成立，跟型別檢查有沒有生效無關）。
+        # 'hooks' 逐字元展開後是 {'h','o','k','s'}（set，重複的 'o' 不影響
+        # collect_source_files() 用 str.startswith(tuple) 做前綴比對的結果）。
+        # 在這裡實際建出其中一個會被展開命中的目錄 'h'，放一個副檔名屬於
+        # 內建 SCAN_EXTS 的檔案 —— 若型別檢查被拿掉，'hooks' 會被展開成
+        # 這幾個單字元目錄，其中 'h' 命中這個檔案，doctor 會印出 OK；
+        # 型別檢查存在時，整層 config 因型別不合法被忽略、退回 builtin
+        # 的 SEARCH_DIRS（這個 tmp repo 底下不存在），維持零命中的 WARN。
+        # 兩種情況因此產生可觀察的差異，測試才真正鎖住型別檢查這個行為。
+        hooks_dir = self.repo / 'h'
+        hooks_dir.mkdir(parents=True)
+        (hooks_dir / 'a.sh').write_text('#!/bin/sh\necho a\n', encoding='utf-8')
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertNotIn('Traceback', out, f'doctor 不得 crash 印 traceback：\n{out}')
+        ok_search_dirs_lines = [
+            l for l in out.splitlines()
+            if PREFIX_RE.match(l) and PREFIX_RE.match(l).group(1) == 'OK'
+            and ('search_dirs' in l or '命中' in l)]
+        self.assertFalse(ok_search_dirs_lines,
+                          f'search_dirs 為裸字串時不得印出 OK（靜默回報健康，'
+                          f'字串會被逐字元展開）：\n{ok_search_dirs_lines}')
+
+
 if __name__ == '__main__':
     unittest.main()
