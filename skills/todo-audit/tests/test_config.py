@@ -4,7 +4,7 @@
 
 介面契約（尚不存在，本檔案預期在 import 階段就 ImportError —— 合格的 RED）：
     import todo_config
-    config, provenance = todo_config.load_config(repo_root, defaults, home=None)
+    config, provenance, warnings = todo_config.load_config(repo_root, defaults, home=None)
 
     - `defaults` 由呼叫端（todo_audit.py）傳入自己既有的 SEARCH_DIRS/SCAN_EXTS 常數，
       todo_config.py 本身不重複硬編一份 BTSE 預設值 —— 避免兩份常數日後漂移。
@@ -70,19 +70,19 @@ class TestLoadConfigLayering(ConfigLayerFixture):
 
     def test_no_config_provenance_all_builtin(self):
         # REQ-1 驗收 7：無任何 config 檔時，provenance 應指出兩個鍵都來自 builtin
-        config, prov = todo_config.load_config(self.repo, _defaults(), home=self.home)
+        config, prov, _ = todo_config.load_config(self.repo, _defaults(), home=self.home)
         self.assertEqual(prov, {'search_dirs': 'builtin', 'scan_exts': 'builtin'})
 
     def test_no_config_values_match_legacy_constants_verbatim(self):
         # REQ-1 驗收 1：BTSE 零回歸保護 —— 無 config 時逐項等於 ed493c1 的常數
-        config, _ = todo_config.load_config(self.repo, _defaults(), home=self.home)
+        config, _, _ = todo_config.load_config(self.repo, _defaults(), home=self.home)
         self.assertEqual(config['search_dirs'], todo_audit.SEARCH_DIRS)
         self.assertEqual(sorted(config['scan_exts']), sorted(todo_audit.SCAN_EXTS))
 
     def test_per_repo_overrides_search_dirs_only_scan_exts_stays_builtin(self):
         # REQ-1 驗收 2：deep merge —— 只設 search_dirs 時 scan_exts 仍為內建 11 個
         self._write_cfg(self.repo, json.dumps({'search_dirs': ['hooks', 'scripts']}))
-        config, prov = todo_config.load_config(self.repo, _defaults(), home=self.home)
+        config, prov, _ = todo_config.load_config(self.repo, _defaults(), home=self.home)
         self.assertEqual(config['search_dirs'], ['hooks', 'scripts'])
         self.assertEqual(sorted(config['scan_exts']), sorted(BUILTIN_SCAN_EXTS))
         self.assertEqual(len(config['scan_exts']), 11)
@@ -93,7 +93,7 @@ class TestLoadConfigLayering(ConfigLayerFixture):
         # REQ-1 驗收 3：同鍵衝突，per-project 勝
         self._write_cfg(self.home, json.dumps({'search_dirs': ['from-user-global']}))
         self._write_cfg(self.repo, json.dumps({'search_dirs': ['from-per-repo']}))
-        config, prov = todo_config.load_config(self.repo, _defaults(), home=self.home)
+        config, prov, _ = todo_config.load_config(self.repo, _defaults(), home=self.home)
         self.assertEqual(config['search_dirs'], ['from-per-repo'])
         self.assertEqual(prov['search_dirs'], 'per-repo')
 
@@ -102,7 +102,7 @@ class TestLoadConfigLayering(ConfigLayerFixture):
         bad = self._write_cfg(self.repo, '{not valid json,,,')
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            config, prov = todo_config.load_config(self.repo, _defaults(), home=self.home)
+            config, prov, _ = todo_config.load_config(self.repo, _defaults(), home=self.home)
         combined = out.getvalue() + err.getvalue()
         self.assertTrue(combined.strip(), '非法 JSON 必須印出可辨識的警告，不得靜默吞掉')
         self.assertIn(str(bad), combined, '警告應指出是哪個檔案壞掉，否則使用者無從修起')
@@ -114,7 +114,7 @@ class TestLoadConfigLayering(ConfigLayerFixture):
         # 「user-global 疊在內建上」，不是退回純內建
         self._write_cfg(self.home, json.dumps({'search_dirs': ['from-user-global']}))
         self._write_cfg(self.repo, '{{{ 壞掉的 json')
-        config, prov = todo_config.load_config(self.repo, _defaults(), home=self.home)
+        config, prov, _ = todo_config.load_config(self.repo, _defaults(), home=self.home)
         self.assertEqual(config['search_dirs'], ['from-user-global'])
         self.assertEqual(prov['search_dirs'], 'user-global')
 
@@ -126,7 +126,7 @@ class TestLoadConfigLayering(ConfigLayerFixture):
         bad = self._write_cfg(self.repo, json.dumps({'search_dirs': 5}))
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            config, prov = todo_config.load_config(self.repo, _defaults(), home=self.home)
+            config, prov, _ = todo_config.load_config(self.repo, _defaults(), home=self.home)
         combined = out.getvalue() + err.getvalue()
         self.assertTrue(combined.strip(), '型別錯誤必須印出可辨識的警告，不得靜默吞掉')
         self.assertIn(str(bad), combined, '警告應指出是哪個檔案壞掉')
@@ -141,7 +141,7 @@ class TestLoadConfigLayering(ConfigLayerFixture):
         bad = self._write_cfg(self.repo, json.dumps({'search_dirs': 'hooks'}))
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            config, prov = todo_config.load_config(self.repo, _defaults(), home=self.home)
+            config, prov, _ = todo_config.load_config(self.repo, _defaults(), home=self.home)
         combined = out.getvalue() + err.getvalue()
         self.assertTrue(combined.strip(), '型別錯誤必須印出可辨識的警告，不得靜默吞掉')
         self.assertIn(str(bad), combined)
@@ -155,7 +155,7 @@ class TestLoadConfigLayering(ConfigLayerFixture):
         bad = self._write_cfg(self.repo, json.dumps({'scan_exts': [1, 2]}))
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            config, prov = todo_config.load_config(self.repo, _defaults(), home=self.home)
+            config, prov, _ = todo_config.load_config(self.repo, _defaults(), home=self.home)
         combined = out.getvalue() + err.getvalue()
         self.assertTrue(combined.strip(), '型別錯誤必須印出可辨識的警告，不得靜默吞掉')
         self.assertIn(str(bad), combined)
@@ -168,7 +168,7 @@ class TestLoadConfigLayering(ConfigLayerFixture):
             '_comment': '這是給人看的說明，不該進 runtime 值',
             'search_dirs': ['hooks'],
         }))
-        config, prov = todo_config.load_config(self.repo, _defaults(), home=self.home)
+        config, prov, _ = todo_config.load_config(self.repo, _defaults(), home=self.home)
         self.assertNotIn('_comment', config)
         self.assertNotIn('_comment', prov)
         self.assertEqual(config['search_dirs'], ['hooks'])

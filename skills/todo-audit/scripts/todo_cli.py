@@ -306,7 +306,14 @@ def cmd_doctor(con, args):
 
     defaults = {'search_dirs': list(todo_audit.SEARCH_DIRS),
                'scan_exts': list(todo_audit.SCAN_EXTS)}
-    config, provenance = todo_config.load_config(repo, defaults, home=home)
+    config, provenance, config_warnings = todo_config.load_config(repo, defaults, home=home)
+    # Stage 7 第五輪：某一層 config 被拒絕（JSON 語法錯誤／型別錯誤）時，
+    # 先前只印到 stderr——若 fallback 到的下一層剛好也命中檔案，下面的
+    # search_dirs 分支會印出一行乾淨的 OK，使用者完全看不出 config 其實
+    # 被拒絕過。這裡把每個被拒絕層的原因印在 OK/WARN 命中判定之前，
+    # 用 doctor 既有的 WARN 前綴格式（可被同一套 PREFIX_RE 抓到）。
+    for w in config_warnings:
+        print(f'WARN config 層被忽略：{w}')
     files, _by_name = todo_audit.collect_source_files(repo, config)
     hit_count = len(files)
     source = provenance.get('search_dirs', 'builtin')

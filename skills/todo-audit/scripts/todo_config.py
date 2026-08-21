@@ -57,12 +57,16 @@ def _typed_key_error(layer):
 
 
 def _load_layer(path):
-    """讀單一層。回傳該層的 dict（已剔除 `_` 前綴鍵），或 None（檔案不存在／非法內容）。
+    """讀單一層。回傳 (layer, warning)：
 
-    非法內容印出警告（含檔案路徑），但不拋例外 —— 該層當作不存在，
-    其餘層照常合併，不得因為一層壞掉就連帶忽略別層。
+    - layer：該層的 dict（已剔除 `_` 前綴鍵），或 None（檔案不存在／非法內容）
+    - warning：None（無異狀），或人類可讀的一行字串，描述這一層為何被忽略
+      （含檔案路徑與原因）——給呼叫端往上傳遞用，不需要重新解析 stderr。
 
-    「非法內容」涵蓋兩種情況，處理方式統一（都是印 WARN + 回 None，
+    非法內容仍印出警告（含檔案路徑）到 stderr，但不拋例外 —— 該層當作
+    不存在，其餘層照常合併，不得因為一層壞掉就連帶忽略別層。
+
+    「非法內容」涵蓋兩種情況，處理方式統一（都是印 WARN + 回 (None, warning)，
     呼叫端 load_config() 不需要知道是哪一種）：
     - JSON 語法錯誤（原有邏輯）
     - search_dirs/scan_exts 型別錯誤（Stage 7 第四輪裁決新增）：值必須是
@@ -71,51 +75,62 @@ def _load_layer(path):
       更危險的靜默失效。
     """
     if not path.exists():
-        return None
+        return None, None
     try:
         raw = json.loads(path.read_text(encoding='utf-8'))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
-        print(f'WARN: 設定檔 {path} 不是合法 JSON（{e}），已忽略此層，其餘層照常生效',
-              file=sys.stderr)
-        return None
+        warning = f'設定檔 {path} 不是合法 JSON（{e}），已忽略此層，其餘層照常生效'
+        print(f'WARN: {warning}', file=sys.stderr)
+        return None, warning
     if not isinstance(raw, dict):
-        print(f'WARN: 設定檔 {path} 內容須是 JSON object，已忽略此層', file=sys.stderr)
-        return None
+        warning = f'設定檔 {path} 內容須是 JSON object，已忽略此層'
+        print(f'WARN: {warning}', file=sys.stderr)
+        return None, warning
     layer = {k: v for k, v in raw.items() if not k.startswith('_')}
     type_error = _typed_key_error(layer)
     if type_error is not None:
         key, value = type_error
-        print(f'WARN: 設定檔 {path} 的 "{key}" 型別錯誤'
-              f'（須為字串陣列 list[str]，實際為 {type(value).__name__}：{value!r}），'
-              f'已忽略此層，其餘層照常生效',
-              file=sys.stderr)
-        return None
-    return layer
+        warning = (f'設定檔 {path} 的 "{key}" 型別錯誤'
+                   f'（須為字串陣列 list[str]，實際為 {type(value).__name__}：{value!r}），'
+                   f'已忽略此層，其餘層照常生效')
+        print(f'WARN: {warning}', file=sys.stderr)
+        return None, warning
+    return layer, None
 
 
 def load_config(repo_root, defaults, home=None):
-    """三層 deep merge，回傳 (config, provenance)。
+    """三層 deep merge，回傳 (config, provenance, warnings)。
 
     - config：合併後的最終值，鍵集合與 `defaults` 相同
     - provenance：每個鍵最終由哪一層決定 —— 'builtin' / 'user-global' / 'per-repo'
       （逐字對應 requirements.md 的層級命名），供 `doctor` 直接消費，
       不必自行重做一次三層探測
+    - warnings：list[str]，每一層被忽略（JSON 語法錯誤或型別錯誤）時的
+      人類可讀說明，依 user-global → per-repo 的檢查順序排列；沒有任何
+      一層失效則為空 list。呼叫端（例如 `doctor`）不需要重新解析 stderr
+      字串就能知道「哪一層被拒絕、為什麼」——這正是 Stage 7 第五輪要堵的
+      缺口：先前只印到 stderr，合併後若 fallback 到的下一層剛好命中檔案，
+      doctor 的 stdout 就會印出一行乾淨的 OK，完全看不出使用者的 config
+      其實被拒絕過。
     """
     per_repo_path, user_global_path = config_paths(repo_root, home)
 
     config = dict(defaults)
     provenance = {k: 'builtin' for k in defaults}
+    warnings = []
 
     for layer_name, path in (('user-global', user_global_path),
                              ('per-repo', per_repo_path)):
-        layer = _load_layer(path)
+        layer, warning = _load_layer(path)
+        if warning is not None:
+            warnings.append(warning)
         if not layer:
             continue
         for k, v in layer.items():
             config[k] = v
             provenance[k] = layer_name
 
-    return config, provenance
+    return config, provenance, warnings
 
 
 # 兩份呼叫端各自加前綴格式化輸出範例 config 用的示範值 —— 逐字一致，

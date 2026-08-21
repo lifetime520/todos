@@ -654,6 +654,14 @@ class TestDoctorConfigTypeError(unittest.TestCase):
             and ('search_dirs' in l or '命中' in l)]
         self.assertFalse(ok_search_dirs_lines,
                           f'search_dirs 型別錯誤時不得印出 OK（靜默回報健康）：\n{ok_search_dirs_lines}')
+        # Stage 7 第五輪補強：型別錯誤本身也要被回報成一行 WARN，
+        # 不能只留在 stderr 的舊訊息格式裡，讓 doctor 消費者無從得知。
+        warn_lines = [
+            l for l in out.splitlines()
+            if PREFIX_RE.match(l) and PREFIX_RE.match(l).group(1) == 'WARN'
+            and '型別' in l]
+        self.assertTrue(warn_lines,
+                         f'config 型別錯誤時 doctor 應印出一行 WARN 前綴的診斷：\n{out}')
 
     def test_string_type_search_dirs_exits_zero_no_traceback_no_ok(self):
         # 常見手誤：忘了寫成陣列，寫成裸字串 'hooks'。這是不 crash 但
@@ -687,6 +695,64 @@ class TestDoctorConfigTypeError(unittest.TestCase):
         self.assertFalse(ok_search_dirs_lines,
                           f'search_dirs 為裸字串時不得印出 OK（靜默回報健康，'
                           f'字串會被逐字元展開）：\n{ok_search_dirs_lines}')
+        # Stage 7 第五輪補強：同上，裸字串手誤也要有一行 WARN 可見。
+        warn_lines = [
+            l for l in out.splitlines()
+            if PREFIX_RE.match(l) and PREFIX_RE.match(l).group(1) == 'WARN'
+            and '型別' in l]
+        self.assertTrue(warn_lines,
+                         f'config 型別錯誤時 doctor 應印出一行 WARN 前綴的診斷：\n{out}')
+
+
+class TestDoctorConfigTypeErrorFallbackAlsoHits(unittest.TestCase):
+    """Stage 7 第五輪：先前兩條 TestDoctorConfigTypeError 測試的 fixture 都是
+    空 repo，fallback 到 builtin 之後零命中，所以「不印 OK」永遠成立，測不出
+    「config 被拒絕」這件事本身有沒有被回報。
+
+    這裡刻意讓 fallback 也命中：repo 底下有 `scripts/foo.sh`（`scripts` 剛好
+    是內建 SEARCH_DIRS 之一，`.sh` 是內建 SCAN_EXTS 之一），per-repo config
+    寫了型別錯誤的 `{"search_dirs": "hooks"}`（字串手誤）。型別檢查正確地
+    拒絕這一層、退回 builtin，而 builtin 的 `scripts/` 命中這個檔案 —— 於是
+    doctor 會印出一行乾淨的 `OK search_dirs 命中 1 個檔案`，如果沒有把
+    「這一層曾被拒絕」往上傳遞出來，使用者完全看不出自己的 config 其實沒生效。
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        tmp = Path(self._tmpdir.name)
+        self.home = tmp / 'home'
+        self.repo = tmp / 'repo'
+        self.repo.mkdir(parents=True)
+        _write_json(self.repo / '.claude' / 'todo-audit.json',
+                    {'search_dirs': 'hooks'})
+        (self.repo / 'scripts').mkdir(parents=True)
+        (self.repo / 'scripts' / 'foo.sh').write_text('#!/bin/sh\necho x\n', encoding='utf-8')
+        _init_db(self.home, 'demo')
+
+    def test_warn_for_rejected_layer_present_even_though_fallback_hits(self):
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertNotIn('Traceback', out, f'doctor 不得 crash 印 traceback：\n{out}')
+
+        lines = [l for l in out.splitlines() if PREFIX_RE.match(l)]
+        warn_lines = [l for l in lines if PREFIX_RE.match(l).group(1) == 'WARN']
+        rejected_layer_warns = [
+            l for l in warn_lines
+            if str(self.repo / '.claude' / 'todo-audit.json') in l and '型別' in l]
+        self.assertTrue(
+            rejected_layer_warns,
+            f'config 層被型別錯誤拒絕時，即使 fallback 命中檔案，doctor 仍須印出'
+            f'一行 WARN 指出是哪個 config 檔案、為何被拒絕：\n{out}')
+
+        ok_lines = [l for l in lines if PREFIX_RE.match(l).group(1) == 'OK'
+                    and ('search_dirs' in l or '命中' in l)]
+        self.assertTrue(
+            ok_lines,
+            f'fallback 到 builtin 的 scripts/ 應該真的命中 foo.py，這行 OK 應該存在：\n{out}')
 
 
 if __name__ == '__main__':

@@ -288,7 +288,7 @@ def collect_source_files(repo, config=None):
     """
     if config is None:
         defaults = {'search_dirs': list(SEARCH_DIRS), 'scan_exts': list(SCAN_EXTS)}
-        config, _ = todo_config.load_config(repo, defaults)
+        config, _, _ = todo_config.load_config(repo, defaults)
     search_dirs = config['search_dirs']
     scan_exts = set(config['scan_exts'])
 
@@ -980,7 +980,7 @@ def main():
     all_anchors = [extract_anchors(t) for t in todos]
 
     defaults = {'search_dirs': list(SEARCH_DIRS), 'scan_exts': list(SCAN_EXTS)}
-    config, provenance = todo_config.load_config(repo, defaults)
+    config, provenance, _ = todo_config.load_config(repo, defaults)
     files, by_name = collect_source_files(repo, config)
     # REQ-2：search_dirs 零命中不再 sys.exit FATAL —— 改為降級掃全 repo，
     # 並全程標記為 WEAK_AUDIT（run 級旗標，見 persist()/todo_store.state_of()）。
