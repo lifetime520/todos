@@ -57,6 +57,25 @@ hook 的判定是「路徑出現在工具參數裡」，不是「行程讀了那
 `list` 是掃視用的清單，不印進度與 spec/memory ——要看某條的細節請用
 `show <T-NNN>` 或 `dump`。
 
+## 依賴圖與變更軌跡
+
+條目間可以記錄有向依賴關係：`blocks`（阻塞執行順序）、`related`（純資訊性關聯）、
+`parent-child`（階層）、`discovered-from`（做這條時發現了那條，記錄來源）。只有
+`blocks`/`parent-child` 在寫入時做環狀依賴檢查（兩者**分開**跑，不合併成同一張
+圖——父任務被自己子任務的 `blocks` 邊卡住是合法情境），偵測到會拒絕並附上具體
+的環路徑（`T-NNN` 形式，不是「有環」三個字）。
+
+`blocked` **不是** `status` 的第五個值——它是依賴圖算出的動態視圖，用
+`list --ready` 查「pending 且未被 `blocks` 邊卡住」的條目。`mark done`/`unpick`
+時若有下游因此變 ready，會印出提示（例如「因此變為可動手（無阻塞）：T-051」），
+但**不會自動改動它們的 status**——動不動手仍由人決定。
+
+`show <T-NNN>` 會列出該條目完整的變更軌跡（`status` 轉換與依賴增刪，append-only、
+新到舊排序，不會被覆寫）。被 `ClaimConflict` 擋下的轉態嘗試不寫入軌跡——只記真正
+發生的變更。`doctor` 會檢查依賴圖的懸空邊（指向不存在的條目）與環狀依賴，只
+`WARN` 不自動修——稽核維持「只給證據，人決定」的既有原則，詳細設計見
+`docs/specs/2026-08-22-todo-dependency-graph-design.md`。
+
 ## 稽核：`todo-audit` skill
 
 待辦會過期，而且**過期的 P0 比沒有 P0 更危險** —— 它持續消耗注意力，還讓真正活著的 P0 顯得不緊急。（實證：`Gate 3 daily-loss 是死碼` 這條 P0 在被修好三天後仍掛在清單上。）
@@ -170,6 +189,16 @@ python3 $T flag <T-NNN> toggle <name>
 # spec_path 與 memory_ref 皆相對 repo root 解析，絕對路徑原樣使用
 python3 $T edit <T-NNN> --spec "docs/specs/2026-08-22-xxx-design.md"
 python3 $T edit <T-NNN> --memory "memory/xxx.md"
+
+# 依賴關係（blocks / related / parent-child / discovered-from）
+python3 $T dep add <from> blocks <to>        # from 阻塞 to；環狀依賴會被拒絕並附具體環路徑
+python3 $T dep add <from> related <to>
+python3 $T dep add <from> parent-child <to>
+python3 $T dep add <from> discovered-from <to>
+python3 $T dep rm  <from> blocks <to>
+python3 $T dep list <T-NNN>                  # 印該條目的所有上下游依賴關係
+
+python3 $T list --ready                      # 只列 pending 且未被 blocks 邊卡住的條目
 
 # 新增（自動 git check + 專案綁定衝突偵測 + 相似度提示）
 bash ~/.claude/hooks/todo-add.sh "任務" "🏷️  tag" "💡  recall"
