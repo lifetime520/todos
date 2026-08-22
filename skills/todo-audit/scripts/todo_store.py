@@ -10,6 +10,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+import todo_deps
 import todo_flags
 
 # 既有六表由 todo_audit.py 的 SCHEMA 建立；此處只做增量 migration。
@@ -70,6 +71,16 @@ CREATE TABLE IF NOT EXISTS todo_line(
   PRIMARY KEY(todo_key, seq));
 CREATE TABLE IF NOT EXISTS doc_meta(
   project TEXT, k TEXT, v TEXT, PRIMARY KEY(project, k));
+CREATE TABLE IF NOT EXISTS todo_dep(
+  from_key TEXT, to_key TEXT, kind TEXT,
+  created_at TEXT, created_by TEXT,
+  PRIMARY KEY(from_key, to_key, kind));
+CREATE TABLE IF NOT EXISTS todo_event(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  todo_key TEXT, action TEXT,
+  old_value TEXT, new_value TEXT,
+  by TEXT, at TEXT);
+CREATE INDEX IF NOT EXISTS ix_event_todo ON todo_event(todo_key);
 """
 
 
@@ -459,6 +470,7 @@ def set_status(con, key, status, by=None, note=None, force=False):
             f'{cur[3] or key[:8]} 已被 {cur[1] or "(未署名)"} 認領於 '
             f'{cur[2] or "時間不明"}（{humanize_age(cur[2])}）。'
             f'確定要接管就加 --force —— 先確認對方 session 真的已經結束')
+    old_status = cur[0]
     # pending = 無人持有。留著舊 status_by 會讓消費端把「上一個做過的人」
     # 讀成「現任擁有者」；status_at 則保留，它此時的語意是「何時釋放」。
     owner = None if status == 'pending' else by
@@ -466,6 +478,7 @@ def set_status(con, key, status, by=None, note=None, force=False):
                 ' WHERE key=?',
                 (status, owner, datetime.now().isoformat(timespec='seconds'),
                  note, key))
+    _record_event(con, key, 'status', old_status, status, by)
     con.commit()
 
 
@@ -602,7 +615,7 @@ def search(con, pattern, include_all=False):
 
 # 帶 todo_key 外鍵的所有表。改 key 或刪條目時必須全部一起處理，
 # 漏一張就留下指向不存在條目的孤兒列。
-_KEYED_TABLES = ('todo_line', 'anchor', 'probe', 'verdict')
+_KEYED_TABLES = ('todo_line', 'anchor', 'probe', 'verdict', 'todo_event')
 
 
 def edit_title(con, key, new_title):
@@ -626,6 +639,40 @@ def edit_title(con, key, new_title):
         for tbl in _KEYED_TABLES:
             con.execute(f'UPDATE {tbl} SET todo_key=? WHERE todo_key=?',
                         (new_key, key))
+        # todo_dep 有 from_key/to_key 兩欄，不符合 _KEYED_TABLES 統一用
+        # todo_key 欄名的假設，獨立處理。不遷移的話依賴圖會斷鏈，且
+        # doctor 的懸空邊 WARN 會把「條目被改名」誤報成「條目被刪除」
+        # （見 requirements.md Stage 2 裁決 G-6）。
+        con.execute('UPDATE todo_dep SET from_key=? WHERE from_key=?',
+                    (new_key, key))
+        con.execute('UPDATE todo_dep SET to_key=? WHERE to_key=?',
+                    (new_key, key))
+        # dep_add/dep_rm 事件的 old_value/new_value 存的是 f'{kind}:{key}'，
+        # 這裡的 key 是「另一側」條目的 key，不是這則事件自己的 todo_key
+        # （後者已經被上面的 _KEYED_TABLES 迴圈遷移）——本條目改名前，
+        # 可能是別條事件（記在別條目名下）裡嵌的那個另一側 key，所以要
+        # 全表掃 dep_add/dep_rm 事件，不能只看本條目名下的列。用
+        # split(':', 1) 拆開再拼回去，不用 .replace() 整段硬換——kind
+        # 欄位（如 parent-child）裡沒有冒號，但全域字串取代仍有機率誤傷
+        # 剛好含相同子字串的其他欄位。
+        for eid, old_v, new_v in con.execute(
+                "SELECT id, old_value, new_value FROM todo_event"
+                " WHERE action IN ('dep_add', 'dep_rm')").fetchall():
+            changed = False
+            if old_v is not None:
+                parts = old_v.split(':', 1)
+                if len(parts) == 2 and parts[1] == key:
+                    old_v = f'{parts[0]}:{new_key}'
+                    changed = True
+            if new_v is not None:
+                parts = new_v.split(':', 1)
+                if len(parts) == 2 and parts[1] == key:
+                    new_v = f'{parts[0]}:{new_key}'
+                    changed = True
+            if changed:
+                con.execute(
+                    'UPDATE todo_event SET old_value=?, new_value=? WHERE id=?',
+                    (old_v, new_v, eid))
     con.execute(
         'UPDATE todo SET key=?, title=?, raw_title=?, section=? WHERE key=?',
         (new_key, full_title, f'- [ ] {full_title}',
@@ -667,6 +714,12 @@ def remove_item(con, key):
     """
     for tbl in _KEYED_TABLES:
         con.execute(f'DELETE FROM {tbl} WHERE todo_key=?', (key,))
+    # todo_dep 有 from_key/to_key 兩欄，不符合 _KEYED_TABLES 統一用
+    # todo_key 欄名的假設，獨立處理（比照 edit_title() 的同款寫法）——
+    # 否則刪除條目會留下懸空邊，讓 is_ready()/doctor 收到使用者自己
+    # 正常操作造成的假警報。
+    con.execute('DELETE FROM todo_dep WHERE from_key=?', (key,))
+    con.execute('DELETE FROM todo_dep WHERE to_key=?', (key,))
     con.execute('DELETE FROM todo WHERE key=?', (key,))
     con.commit()
 
@@ -709,3 +762,138 @@ def set_memory_ref(con, key, path):
     """設定 auto memory 系統的相關檔案參照，語意同 set_spec_path。"""
     con.execute('UPDATE todo SET memory_ref=? WHERE key=?', (path, key))
     con.commit()
+
+
+# ---------------------------------------------------------------- 依賴圖／變更軌跡
+
+def _record_event(con, key, action, old_value, new_value, by):
+    con.execute(
+        'INSERT INTO todo_event(todo_key,action,old_value,new_value,by,at)'
+        ' VALUES(?,?,?,?,?,?)',
+        (key, action, old_value, new_value, by,
+         datetime.now().isoformat(timespec='seconds')))
+
+
+def list_events(con, key):
+    """該條目的完整變更軌跡，新到舊。"""
+    return con.execute(
+        'SELECT action, old_value, new_value, by, at FROM todo_event'
+        ' WHERE todo_key=? ORDER BY at DESC, id DESC', (key,)).fetchall()
+
+
+def _key_exists(con, key):
+    return con.execute('SELECT 1 FROM todo WHERE key=?', (key,)).fetchone() is not None
+
+
+def add_dep(con, from_key, to_key, kind, by=None):
+    """新增一條依賴邊。blocks/parent-child 寫入前做環狀依賴檢查，
+    偵測到就 raise ValueError 並附上具體的環路徑（用 short_id 呈現，
+    不是「有環」三個字）。重複新增同一條邊視為錯誤——與 remove_dep/
+    remove_line 等既有函式對「找不到」的處理方式對稱，不靜默吞掉
+    （見 requirements.md Stage 2 裁決 G-5：靜默 no-op 會讓「打錯 kind
+    後補一次正確呼叫」跟「單純重跑」混為一談）。
+    """
+    todo_deps.validate_kind(kind)
+    for k in (from_key, to_key):
+        if not _key_exists(con, k):
+            raise KeyError(k)
+    if kind in ('blocks', 'parent-child'):
+        # G-3：只用同一種 kind 的既有邊做 DFS —— blocks 與 parent-child
+        # 分開各自成圖，不合併，避免合法的「父任務被子任務的 blocks
+        # 邊卡住」被誤判成死鎖。
+        existing = con.execute(
+            'SELECT from_key, to_key FROM todo_dep WHERE kind=?',
+            (kind,)).fetchall()
+        cycle = todo_deps.find_cycle(existing, from_key, to_key)
+        if cycle:
+            names = ' → '.join(
+                con.execute('SELECT short_id FROM todo WHERE key=?',
+                            (k,)).fetchone()[0] for k in cycle)
+            raise ValueError(f'會造成環狀依賴：{names}')
+    try:
+        con.execute(
+            'INSERT INTO todo_dep(from_key,to_key,kind,created_at,created_by)'
+            ' VALUES(?,?,?,?,?)',
+            (from_key, to_key, kind,
+             datetime.now().isoformat(timespec='seconds'), by))
+    except sqlite3.IntegrityError:
+        # 訊息要讓人當場對得上清單上的編號，不能印內部 sha1 key——
+        # 比照上面環狀依賴分支與 list_deps() 的既有寫法轉成 short_id，
+        # 查無 short_id 時 fallback 用 key[:8]。
+        from_sid = con.execute('SELECT short_id FROM todo WHERE key=?',
+                               (from_key,)).fetchone()
+        to_sid = con.execute('SELECT short_id FROM todo WHERE key=?',
+                             (to_key,)).fetchone()
+        raise ValueError(
+            f'{from_sid[0] if from_sid else from_key[:8]} -{kind}-> '
+            f'{to_sid[0] if to_sid else to_key[:8]} 已存在')
+    _record_event(con, from_key, 'dep_add', None, f'{kind}:{to_key}', by)
+    con.commit()
+
+
+def remove_dep(con, from_key, to_key, kind, by=None):
+    """刪除一條依賴邊。邊不存在 raise KeyError（比照 remove_line 的既有慣例：
+    刪除不存在的東西是錯誤，不是靜默成功）。"""
+    todo_deps.validate_kind(kind)
+    cur = con.execute(
+        'DELETE FROM todo_dep WHERE from_key=? AND to_key=? AND kind=?',
+        (from_key, to_key, kind))
+    if cur.rowcount == 0:
+        raise KeyError(f'{from_key} -{kind}-> {to_key} 不存在')
+    _record_event(con, from_key, 'dep_rm', f'{kind}:{to_key}', None, by)
+    con.commit()
+
+
+def list_deps(con, key):
+    """回傳 (direction, kind, other_key, other_short_id) 的 list。
+    from_key=key（本條目是起點，direction='out'）與 to_key=key（本條目是
+    終點，direction='in'）都要列，show 才能同時呈現「我阻塞誰」與
+    「誰阻塞我」。"""
+    out = []
+    for kind, other in con.execute(
+            'SELECT kind, to_key FROM todo_dep WHERE from_key=?', (key,)):
+        sid = con.execute('SELECT short_id FROM todo WHERE key=?',
+                          (other,)).fetchone()
+        out.append(('out', kind, other, sid[0] if sid else other[:8]))
+    for kind, other in con.execute(
+            'SELECT kind, from_key FROM todo_dep WHERE to_key=?', (key,)):
+        sid = con.execute('SELECT short_id FROM todo WHERE key=?',
+                          (other,)).fetchone()
+        out.append(('in', kind, other, sid[0] if sid else other[:8]))
+    return out
+
+
+def is_ready(con, key):
+    """該條目是否 pending 且未被任何 blocks 邊卡住。"""
+    row = con.execute('SELECT status FROM todo WHERE key=?', (key,)).fetchone()
+    if row is None:
+        raise KeyError(key)
+    blockers = [r[0] for r in con.execute(
+        "SELECT from_key FROM todo_dep WHERE to_key=? AND kind='blocks'", (key,))]
+    # blocker 可能已被 remove_item() 刪除（懸空邊）——查無此列時 status 視為
+    # None，交給 todo_deps.is_ready() 判斷（那邊已正確處理 None：
+    # 已刪除的 blocker 不算 done/unpick，條目仍算被卡住）。
+    blocker_statuses = []
+    for b in blockers:
+        r = con.execute('SELECT status FROM todo WHERE key=?', (b,)).fetchone()
+        blocker_statuses.append(r[0] if r else None)
+    return todo_deps.is_ready(row[0], blocker_statuses)
+
+
+def ready_keys(con):
+    """全部 pending 且未被阻塞的條目 key 清單，供 `list --ready` 使用。"""
+    pending = [r[0] for r in con.execute(
+        "SELECT key FROM todo WHERE status='pending' AND sort_order IS NOT NULL")]
+    return [k for k in pending if is_ready(con, k)]
+
+
+def newly_unblocked_after(con, key):
+    """key 剛轉 done/unpick 後，回傳因此變 ready 的下游 short_id 清單。"""
+    edges = con.execute(
+        "SELECT from_key, to_key FROM todo_dep WHERE kind='blocks'").fetchall()
+    all_keys = [r[0] for r in con.execute('SELECT key FROM todo')]
+    statuses = {k: con.execute('SELECT status FROM todo WHERE key=?',
+                               (k,)).fetchone()[0] for k in all_keys}
+    downstream = todo_deps.newly_unblocked(key, edges, statuses)
+    return [con.execute('SELECT short_id FROM todo WHERE key=?',
+                        (k,)).fetchone()[0] for k in downstream]

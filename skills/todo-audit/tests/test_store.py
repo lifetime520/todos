@@ -640,5 +640,310 @@ class TestProgressFlags(unittest.TestCase):
         self.assertEqual(row, ('docs/specs/x.md', 'memory/y.md'))
 
 
+class TestDependencyGraph(unittest.TestCase):
+    """todo_dep / todo_event：依賴圖 CRUD 與 append-only 變更軌跡。
+
+    Covers: REQ-1, REQ-2, REQ-3, REQ-5, REQ-6, REQ-7, REQ-9, G-3, G-5, G-6
+    （REQ-4 的 CLI 提示文字不在本 task 範圍，這裡只測它依賴的 store 層
+    介面 newly_unblocked_after）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dbpath = Path(self.tmp.name) / 't.sqlite'
+        self.con = todo_store.connect(self.dbpath)
+        self.keys = {}
+        for label in ('A', 'B', 'C', 'D'):
+            sid = todo_store.append_item(self.con, 'demo', f'條目{label}', '', '')
+            self.keys[label] = self.con.execute(
+                'SELECT key FROM todo WHERE short_id=?', (sid,)).fetchone()[0]
+
+    def tearDown(self):
+        self.con.close()
+        self.tmp.cleanup()
+
+    def _short_id(self, key):
+        return self.con.execute(
+            'SELECT short_id FROM todo WHERE key=?', (key,)).fetchone()[0]
+
+    def _dep_count(self):
+        return self.con.execute('SELECT COUNT(*) FROM todo_dep').fetchone()[0]
+
+    # REQ-9
+    def test_migration_creates_dep_and_event_tables(self):
+        tables = {r[0] for r in self.con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertIn('todo_dep', tables)
+        self.assertIn('todo_event', tables)
+
+    # REQ-9（驗收：對已升級過的 DB 重複 connect() 不拋例外，資料不變）
+    def test_connect_twice_on_upgraded_db_is_idempotent(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        self.con.close()
+        self.con = todo_store.connect(self.dbpath)   # 第二次 connect
+        self.con.close()
+        self.con = todo_store.connect(self.dbpath)   # 第三次，仍不得拋例外
+        row = self.con.execute(
+            'SELECT from_key, to_key, kind FROM todo_dep').fetchone()
+        self.assertEqual(row, (self.keys['A'], self.keys['B'], 'blocks'))
+
+    # REQ-1
+    def test_add_dep_creates_row(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks',
+                           by='sess-a')
+        row = self.con.execute(
+            'SELECT from_key, to_key, kind, created_by FROM todo_dep').fetchone()
+        self.assertEqual(row, (self.keys['A'], self.keys['B'], 'blocks', 'sess-a'))
+
+    # REQ-6
+    def test_add_dep_records_event(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks',
+                           by='sess-a')
+        action, old, new, by, at = todo_store.list_events(
+            self.con, self.keys['A'])[0]
+        self.assertEqual(action, 'dep_add')
+        self.assertIsNone(old)
+        self.assertIn('blocks', new)
+        self.assertEqual(by, 'sess-a')
+
+    # REQ-1
+    def test_add_dep_unknown_kind_raises_value_error_and_writes_nothing(self):
+        with self.assertRaises(ValueError):
+            todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'bogus')
+        self.assertEqual(self._dep_count(), 0)
+
+    # REQ-1
+    def test_add_dep_unknown_key_raises_key_error(self):
+        with self.assertRaises(KeyError):
+            todo_store.add_dep(self.con, 'nosuchkey', self.keys['B'], 'blocks')
+        self.assertEqual(self._dep_count(), 0)
+
+    # G-5：重複邊視為錯誤，不是靜默 no-op —— 訊息要可讀，不是裸
+    # sqlite3.IntegrityError 的 traceback；也不得多寫一筆事件。
+    def test_add_dep_duplicate_edge_raises_readable_error(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        with self.assertRaises(ValueError) as ctx:
+            todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        self.assertNotIsInstance(ctx.exception, sqlite3.IntegrityError)
+        self.assertIn('已存在', str(ctx.exception))
+        events = [e for e in todo_store.list_events(self.con, self.keys['A'])
+                 if e[0] == 'dep_add']
+        self.assertEqual(len(events), 1)
+        self.assertEqual(self._dep_count(), 1)
+
+    # REQ-2：訊息要附「具體環路徑」（至少含 A、B 的 short_id），
+    # 不是「有環」三個字就算數。
+    def test_add_dep_cyclic_blocks_rejected_with_readable_message(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        a_sid = self._short_id(self.keys['A'])
+        b_sid = self._short_id(self.keys['B'])
+        with self.assertRaises(ValueError) as ctx:
+            todo_store.add_dep(self.con, self.keys['B'], self.keys['A'], 'blocks')
+        msg = str(ctx.exception)
+        self.assertIn('環', msg)
+        self.assertIn(a_sid, msg)
+        self.assertIn(b_sid, msg)
+        # 被拒絕的邊不該真的寫進去
+        self.assertEqual(self._dep_count(), 1)
+
+    # 全域約束：被環狀依賴拒絕的 dep add 不寫事件
+    def test_add_dep_cyclic_reject_does_not_write_event(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        with self.assertRaises(ValueError):
+            todo_store.add_dep(self.con, self.keys['B'], self.keys['A'], 'blocks')
+        events = [e for e in todo_store.list_events(self.con, self.keys['B'])
+                 if e[0] == 'dep_add']
+        self.assertEqual(len(events), 0)
+
+    # REQ-2（邊界，比照 test_deps.py 的 test_self_dependency_is_a_cycle）：
+    # 條目依賴自己必須被當成環拒絕，不能因為圖裡還沒有其他邊就放行。
+    def test_add_dep_self_loop_rejected_as_cycle(self):
+        with self.assertRaises(ValueError) as ctx:
+            todo_store.add_dep(self.con, self.keys['A'], self.keys['A'], 'blocks')
+        self.assertIn('環', str(ctx.exception))
+        self.assertEqual(self._dep_count(), 0)
+
+    # REQ-2：related 無序性，反向也該能加，不該被誤判成環
+    # （related/discovered-from 兩種邊完全不做環狀依賴檢查）。
+    def test_add_dep_related_kind_allows_reciprocal_without_cycle_check(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'related')
+        todo_store.add_dep(self.con, self.keys['B'], self.keys['A'], 'related')
+        self.assertEqual(self._dep_count(), 2)
+
+    # G-3：blocks 與 parent-child 分開跑環檢查，不合併成同一張圖——
+    # 父任務被自己的子任務（透過 blocks 邊）卡住是合法且常見的模式，
+    # 若誤合併成一張圖，這種合法情境會被錯誤地當成死鎖擋下。
+    def test_add_dep_blocks_and_parent_child_graphs_are_independent(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        # B parent-child-> A：跟上面那條 blocks 邊方向相反，若兩張圖被
+        # 誤合併成一張，這裡會被誤判成環而拒絕；分開跑則應該成功。
+        todo_store.add_dep(self.con, self.keys['B'], self.keys['A'], 'parent-child')
+        kinds = {r[0] for r in self.con.execute('SELECT kind FROM todo_dep')}
+        self.assertEqual(kinds, {'blocks', 'parent-child'})
+
+    # REQ-1 / REQ-6
+    def test_remove_dep_deletes_row_and_records_event(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        todo_store.remove_dep(self.con, self.keys['A'], self.keys['B'], 'blocks',
+                              by='sess-a')
+        self.assertEqual(self._dep_count(), 0)
+        action = todo_store.list_events(self.con, self.keys['A'])[0][0]
+        self.assertEqual(action, 'dep_rm')
+
+    # REQ-1
+    def test_remove_dep_missing_raises_key_error(self):
+        with self.assertRaises(KeyError):
+            todo_store.remove_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+
+    # REQ-1（remove_dep 跟 add_dep 一樣要驗證 kind，不能只驗證存在性）
+    def test_remove_dep_unknown_kind_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            todo_store.remove_dep(self.con, self.keys['A'], self.keys['B'], 'bogus')
+
+    # REQ-1：show 要能同時呈現「我阻塞誰」（out）與「誰阻塞我」（in）
+    def test_list_deps_returns_both_directions(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        a_sid = self._short_id(self.keys['A'])
+        b_sid = self._short_id(self.keys['B'])
+        out_from_a = todo_store.list_deps(self.con, self.keys['A'])
+        out_from_b = todo_store.list_deps(self.con, self.keys['B'])
+        self.assertEqual(out_from_a, [('out', 'blocks', self.keys['B'], b_sid)])
+        self.assertEqual(out_from_b, [('in', 'blocks', self.keys['A'], a_sid)])
+
+    # REQ-3
+    def test_is_ready_true_when_no_blockers(self):
+        self.assertTrue(todo_store.is_ready(self.con, self.keys['A']))
+
+    # REQ-3
+    def test_is_ready_false_when_blocked_by_pending(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        self.assertFalse(todo_store.is_ready(self.con, self.keys['B']))
+
+    # REQ-3
+    def test_is_ready_true_once_blocker_done(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        todo_store.set_status(self.con, self.keys['A'], 'done')
+        self.assertTrue(todo_store.is_ready(self.con, self.keys['B']))
+
+    # REQ-3（邊界：查不存在的條目不該悄悄回 False，要讓呼叫端知道 key 錯了）
+    def test_is_ready_unknown_key_raises_key_error(self):
+        with self.assertRaises(KeyError):
+            todo_store.is_ready(self.con, 'nosuchkey')
+
+    # REQ-3
+    def test_ready_keys_excludes_blocked_and_non_pending(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        todo_store.set_status(self.con, self.keys['C'], 'doing', by='x')
+        ready = todo_store.ready_keys(self.con)
+        self.assertNotIn(self.keys['B'], ready)   # 被 A 卡住
+        self.assertNotIn(self.keys['C'], ready)   # 不是 pending
+        self.assertIn(self.keys['D'], ready)      # 沒被任何邊卡住
+
+    # REQ-4（store 層介面；CLI 印出「可動手」提示的行為屬於其他 task）
+    def test_newly_unblocked_after_done_transition(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        todo_store.set_status(self.con, self.keys['A'], 'done')
+        unblocked = todo_store.newly_unblocked_after(self.con, self.keys['A'])
+        b_sid = self._short_id(self.keys['B'])
+        self.assertEqual(unblocked, [b_sid])
+
+    # REQ-5：blocked 不得成為 status 的第五個值，即使呼叫端硬塞這個字串
+    def test_set_status_rejects_blocked_as_status_value(self):
+        with self.assertRaises(ValueError):
+            todo_store.set_status(self.con, self.keys['A'], 'blocked')
+
+    # REQ-6
+    def test_set_status_records_event(self):
+        todo_store.set_status(self.con, self.keys['A'], 'doing', by='sess-a')
+        action, old, new, by, at = todo_store.list_events(
+            self.con, self.keys['A'])[0]
+        self.assertEqual(action, 'status')
+        self.assertEqual(old, 'pending')
+        self.assertEqual(new, 'doing')
+        self.assertEqual(by, 'sess-a')
+
+    # REQ-7：軌跡只記真正發生的變更，被 ClaimConflict 擋下的轉態不算數
+    def test_set_status_does_not_record_event_on_claim_conflict(self):
+        todo_store.set_status(self.con, self.keys['A'], 'doing', by='sess-a')
+        with self.assertRaises(todo_store.ClaimConflict):
+            todo_store.set_status(self.con, self.keys['A'], 'done', by='sess-b')
+        events = todo_store.list_events(self.con, self.keys['A'])
+        self.assertEqual(len(events), 1)  # 只有原本那次成功的 doing 轉態
+
+    # REQ-6：doing -> done -> dep add 三類事件都要出現在同一份軌跡裡，
+    # 且是三個獨立列，不是同一列被 UPDATE 覆寫成最後一次的值。
+    def test_event_trail_accumulates_across_status_and_dep_changes(self):
+        todo_store.set_status(self.con, self.keys['A'], 'doing', by='sess-a')
+        # 同一個 owner 把自己認領的條目轉 done，不該被 ClaimConflict 擋下——
+        # by 要跟認領時一致，否則守衛會把 None 當成不同人
+        todo_store.set_status(self.con, self.keys['A'], 'done', by='sess-a')
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        raw_count = self.con.execute(
+            'SELECT COUNT(*) FROM todo_event WHERE todo_key=?',
+            (self.keys['A'],)).fetchone()[0]
+        self.assertEqual(raw_count, 3, '三次變更該是三個獨立列')
+        events = todo_store.list_events(self.con, self.keys['A'])
+        self.assertEqual([e[0] for e in events], ['dep_add', 'status', 'status'])
+        self.assertEqual(events[1][2], 'done')    # 較新的 status 事件
+        self.assertEqual(events[2][2], 'doing')   # 較舊的 status 事件
+
+    # REQ-6
+    def test_list_events_orders_newest_first(self):
+        todo_store.set_status(self.con, self.keys['A'], 'doing', by='sess-a')
+        todo_store.set_status(self.con, self.keys['A'], 'done', by='sess-a')
+        events = todo_store.list_events(self.con, self.keys['A'])
+        self.assertEqual(events[0][2], 'done')
+        self.assertEqual(events[1][2], 'doing')
+
+    # G-6：改標題必換 key（既有行為）。todo_dep 有 from_key/to_key 兩個
+    # 獨立欄位，各自都要遷移——只改其中一欄會在另一欄留下孤兒邊，
+    # 且 doctor 的懸空邊 WARN 會把「條目被改名」誤報成「條目被刪除」。
+    def test_edit_title_migrates_both_from_and_to_key_dep_edges(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')  # A->B
+        todo_store.add_dep(self.con, self.keys['C'], self.keys['A'], 'blocks')  # C->A
+        new_key = todo_store.edit_title(self.con, self.keys['A'], '新標題A')
+        self.assertNotEqual(new_key, self.keys['A'])
+
+        from_side = self.con.execute(
+            'SELECT from_key FROM todo_dep WHERE to_key=?',
+            (self.keys['B'],)).fetchone()[0]
+        to_side = self.con.execute(
+            'SELECT to_key FROM todo_dep WHERE from_key=?',
+            (self.keys['C'],)).fetchone()[0]
+        self.assertEqual(from_side, new_key, 'from_key 欄沒跟著搬')
+        self.assertEqual(to_side, new_key, 'to_key 欄沒跟著搬')
+
+        # 舊 key 不該再留下任何孤兒邊（不論它原本是 from_key 還是 to_key）
+        orphan = self.con.execute(
+            'SELECT COUNT(*) FROM todo_dep WHERE from_key=? OR to_key=?',
+            (self.keys['A'], self.keys['A'])).fetchone()[0]
+        self.assertEqual(orphan, 0)
+
+    # G-6：todo_event 併入 _KEYED_TABLES 的遷移迴圈——舊 key 查詢必須
+    # 完全查不到孤兒事件，不是只驗證新 key 查得到就算數。
+    def test_edit_title_migrates_event_history_to_new_key(self):
+        todo_store.set_status(self.con, self.keys['A'], 'doing', by='sess-a')
+        new_key = todo_store.edit_title(self.con, self.keys['A'], '新標題A')
+
+        orphan = self.con.execute(
+            'SELECT COUNT(*) FROM todo_event WHERE todo_key=?',
+            (self.keys['A'],)).fetchone()[0]
+        self.assertEqual(orphan, 0, '舊 key 底下不該留下孤兒事件列')
+        self.assertEqual(todo_store.list_events(self.con, self.keys['A']), [])
+
+        events_new = todo_store.list_events(self.con, new_key)
+        self.assertEqual(len(events_new), 1)
+        self.assertEqual(events_new[0][2], 'doing')
+
+    # G-6 最刁鑽的情境：事件記在 A 名下（因為 add_dep 只在 from_key 側寫事件），
+    # 但改名的是 B（邊的另一側）——A 名下事件裡嵌的 B key 也要跟著換。
+    # 這是全表掃描（而非只篩被改名條目自己的 todo_key）存在的理由。
+    def test_edit_title_migrates_embedded_key_in_other_entrys_event(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        new_key_b = todo_store.edit_title(self.con, self.keys['B'], '新標題B')
+        ev = todo_store.list_events(self.con, self.keys['A'])
+        self.assertEqual(ev[0][2], f'blocks:{new_key_b}')
+
+
 if __name__ == '__main__':
     unittest.main()
