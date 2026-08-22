@@ -569,8 +569,18 @@ class TestProgressFlagCommand(unittest.TestCase):
         self.assertIn('docs/specs/x.md', r.stdout)
         self.assertIn('memory/y.md', r.stdout)
 
-    def test_list_omits_spec_memory_lines_when_unset(self):
+    def test_list_never_shows_progress_or_refs(self):
+        # list 是掃視用的清單，進度/spec/memory 屬於「要細節時才看」的
+        # 資訊（show/dump 已提供）——即使條目確實設了旗標與參照，list
+        # 也不該印出來，不然每條都多一行洗版。
+        run_cli('flag', 'T-001', 'set', 'implemented',
+                '--project', 'demo', env_home=self.home)
+        run_cli('edit', 'T-001', '--spec', 'docs/specs/x.md',
+                '--memory', 'memory/y.md',
+                '--project', 'demo', env_home=self.home)
         r = run_cli('list', '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('進度', r.stdout)
         self.assertNotIn('spec:', r.stdout)
         self.assertNotIn('memory:', r.stdout)
 

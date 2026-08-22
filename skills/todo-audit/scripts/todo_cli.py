@@ -103,15 +103,15 @@ def item_progress_lines(progress, spec_path, memory_ref, indent='  '):
 
 
 def cmd_list(con, args):
+    # list 刻意不印進度／spec／memory —— 那些是「要這條的細節時」才需要
+    # 的資訊（show/dump 已經提供），每條都印只會讓這份本來就長的清單
+    # 更長，而多數項目根本還沒動過任何旗標。
     print(header(con))
-    for (sid, key, raw, status, sby, sat, progress, spec_path,
-        memory_ref) in rows(con, section=args.section, only_doing=args.doing,
-                            by=args.by):
+    for (sid, key, raw, status, sby, sat, _progress, _spec_path,
+        _memory_ref) in rows(con, section=args.section, only_doing=args.doing,
+                             by=args.by):
         st = todo_store.state_of(con, key)
         print(f'  {sid}  [{st}]{claim_tag(status, sby, sat)} {raw[6:]}')
-        for line in item_progress_lines(progress, spec_path, memory_ref,
-                                        indent='      '):
-            print(line)
 
 
 def cmd_show(con, args):

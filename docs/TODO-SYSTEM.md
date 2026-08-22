@@ -54,6 +54,9 @@ hook 的判定是「路徑出現在工具參數裡」，不是「行程讀了那
 參照印 WARN，避免靜默過期。詳細設計見
 `docs/specs/2026-08-22-todo-progress-bitmask-design.md`。
 
+`list` 是掃視用的清單，不印進度與 spec/memory ——要看某條的細節請用
+`show <T-NNN>` 或 `dump`。
+
 ## 稽核：`todo-audit` skill
 
 待辦會過期，而且**過期的 P0 比沒有 P0 更危險** —— 它持續消耗注意力，還讓真正活著的 P0 顯得不緊急。（實證：`Gate 3 daily-loss 是死碼` 這條 P0 在被修好三天後仍掛在清單上。）
