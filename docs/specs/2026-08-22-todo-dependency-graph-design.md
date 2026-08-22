@@ -167,8 +167,8 @@ python3 $T list --ready                    # pending 且未被 blocks 邊卡住�
 
 ## 8. doctor 整合
 
-`todo_audit.py` 的 doctor 新增兩項檢查（沿用位元旗標設計已定的 WARN 輸出格式，
-印在 stdout）：
+`todo_cli.py` 的 `cmd_doctor`（既有 `spec_path`/`memory_ref` 參照檢查所在位置）
+新增兩項檢查，沿用同一套 WARN 輸出格式，印在 stdout：
 
 1. **懸空依賴**：`todo_dep` 的 `from_key`/`to_key` 若指向不存在的 `todo.key`
    （條目被 `rm --force` 永久刪除後留下的孤兒邊），WARN 並列出。
@@ -201,8 +201,8 @@ python3 $T list --ready                    # pending 且未被 blocks 邊卡住�
   `todo_event` 寫入的欄位正確性、`rm --force` 後懸空邊的產生（供 doctor 測試用）。
 - `todo_cli.py`：`dep add/rm/list` 整合測試、`list --ready` 的過濾邏輯、
   `mark done` 印出 newly-unblocked 提示的整合測試。
-- `todo_audit.py` doctor：懸空依賴與環狀依賴兩種 WARN 的整合測試，比照
-  `test_doctor.py` 既有寫法。
+- `todo_cli.py` 的 `cmd_doctor`：懸空依賴與環狀依賴兩種 WARN 的整合測試，
+  比照 `test_doctor.py` 既有寫法。
 
 ## 11. 遷移策略
 
