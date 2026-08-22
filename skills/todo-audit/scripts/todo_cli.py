@@ -311,6 +311,13 @@ def cmd_audit(con, args):
                             str(db_for(args.project_resolved)), '.'])
 
 
+def _resolve_ref_path(base, value):
+    """spec_path 相對 repo root、memory_ref 相對 HOME 解析；
+    絕對路徑原樣使用。"""
+    p = Path(value)
+    return p if p.is_absolute() else base / value
+
+
 def cmd_doctor(con, args):
     """自我診斷（REQ-3）。逐行 OK/WARN/FAIL 前綴、純文字無顏色、可 grep，
     exit code 恆為 0 —— 診斷工具的職責是印出發現，不是自己跑不起來。
@@ -356,6 +363,16 @@ def cmd_doctor(con, args):
                       'search_dirs 零命中，死碼偵測（GONE 判定）當次失效')
             else:
                 print('OK   上次稽核未處於降級狀態')
+
+    if con is not None:
+        for sid, spec_path, memory_ref in con.execute(
+                "SELECT short_id, spec_path, memory_ref FROM todo"
+                " WHERE sort_order IS NOT NULL"
+                " AND (spec_path IS NOT NULL OR memory_ref IS NOT NULL)"):
+            if spec_path and not _resolve_ref_path(repo, spec_path).exists():
+                print(f'WARN {sid} 的 spec_path 指向不存在的檔案：{spec_path}')
+            if memory_ref and not _resolve_ref_path(home, memory_ref).exists():
+                print(f'WARN {sid} 的 memory_ref 指向不存在的檔案：{memory_ref}')
 
     defaults = {'search_dirs': list(todo_audit.SEARCH_DIRS),
                'scan_exts': list(todo_audit.SCAN_EXTS)}

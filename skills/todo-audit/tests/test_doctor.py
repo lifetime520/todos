@@ -755,5 +755,50 @@ class TestDoctorConfigTypeErrorFallbackAlsoHits(unittest.TestCase):
             f'fallback 到 builtin 的 scripts/ 應該真的命中 foo.py，這行 OK 應該存在：\n{out}')
 
 
+class TestDoctorDanglingRefs(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        tmp = Path(self._tmpdir.name)
+        self.home = tmp / 'home'
+        self.repo = tmp / 'repo'
+        self.repo.mkdir(parents=True)
+        db = _init_db(self.home, 'demo')
+        con = todo_store.connect(db)
+        sid = todo_store.append_item(con, 'demo', '測試條目', '', '')
+        key = con.execute('SELECT key FROM todo WHERE short_id=?',
+                          (sid,)).fetchone()[0]
+        todo_store.set_spec_path(con, key, 'docs/specs/not-exist.md')
+        todo_store.set_memory_ref(con, key, 'memory/not-exist.md')
+        con.close()
+        self.sid = sid
+
+    def test_dangling_spec_path_warns_on_stdout(self):
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        self.assertIn('WARN', r.stdout)
+        self.assertIn('not-exist.md', r.stdout)
+        self.assertIn(self.sid, r.stdout)
+
+    def test_dangling_ref_does_not_fail_doctor(self):
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_existing_ref_does_not_warn(self):
+        (self.repo / 'docs' / 'specs').mkdir(parents=True)
+        (self.repo / 'docs' / 'specs' / 'ok.md').write_text('x', encoding='utf-8')
+        con = todo_store.connect(_init_db(self.home, 'demo2'))
+        sid = todo_store.append_item(con, 'demo2', '正常條目', '', '')
+        key = con.execute('SELECT key FROM todo WHERE short_id=?',
+                          (sid,)).fetchone()[0]
+        todo_store.set_spec_path(con, key, 'docs/specs/ok.md')
+        con.close()
+        r = run_cli('doctor', '--project', 'demo2',
+                    env_home=self.home, cwd=self.repo)
+        self.assertNotIn('ok.md', r.stdout.replace('OK', ''))
+
+
 if __name__ == '__main__':
     unittest.main()
