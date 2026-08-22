@@ -42,6 +42,18 @@ hook 的判定是「路徑出現在工具參數裡」，不是「行程讀了那
 
 不要留著已完成的項目，保持列表只有真正 pending 的事情。
 
+## 交付進度與 status 的關係
+
+`status`（pending/doing/done/unpick）與交付進度 `progress` 位元旗標是
+兩個正交的維度：前者答「誰在做、要不要做」，後者答「做到哪個階段」。
+七個位元互不強制順序，各自獨立可點。**進度全滿時單向自動轉
+`status=done`**（`unpick` 的條目不受此影響）；反過來手動 `mark done`
+不會強制把進度一併點滿——不是每條 todo 都走得完整個 pipeline。
+
+`doctor` 會檢查每條 `--spec`/`--memory` 參照的檔案是否存在，壞掉的
+參照印 WARN，避免靜默過期。詳細設計見
+`docs/specs/2026-08-22-todo-progress-bitmask-design.md`。
+
 ## 稽核：`todo-audit` skill
 
 待辦會過期，而且**過期的 P0 比沒有 P0 更危險** —— 它持續消耗注意力，還讓真正活著的 P0 顯得不緊急。（實證：`Gate 3 daily-loss 是死碼` 這條 P0 在被修好三天後仍掛在清單上。）
@@ -143,6 +155,17 @@ python3 $T edit <T-NNN> --title "新標題"           # 日期前綴自動保留
 python3 $T edit <T-NNN> "🏷️  新內容" --line 1      # 改某行（序號見 show --seq）
 python3 $T rm   <T-NNN> --line 2                   # 刪某行
 python3 $T rm   <T-NNN> --force                    # 永久刪除整條
+
+# 交付進度位元旗標（實作/review/commit/compile/test/live_tested/deploy）
+python3 $T flag <T-NNN> set <name>      # 例：flag T-042 set reviewed
+python3 $T flag <T-NNN> clear <name>
+python3 $T flag <T-NNN> toggle <name>
+# name ∈ implemented / reviewed / committed / compiled / tested / live_tested / deployed
+# 七個旗標全數點滿時，status 會自動轉為 done（unpick 條目不受影響）
+
+# 規格文件 / session memory 參照（只存路徑字串，不驗證存在；doctor 會檢查）
+python3 $T edit <T-NNN> --spec "docs/specs/2026-08-22-xxx-design.md"
+python3 $T edit <T-NNN> --memory "memory/xxx.md"
 
 # 新增（自動 git check + 專案綁定衝突偵測 + 相似度提示）
 bash ~/.claude/hooks/todo-add.sh "任務" "🏷️  tag" "💡  recall"
