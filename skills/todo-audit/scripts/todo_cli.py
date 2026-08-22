@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import todo_deps
 import todo_flags
 import todo_store
 
@@ -107,9 +108,14 @@ def cmd_list(con, args):
     # 的資訊（show/dump 已經提供），每條都印只會讓這份本來就長的清單
     # 更長，而多數項目根本還沒動過任何旗標。
     print(header(con))
+    # --ready：只列 pending 且未被任何 blocks 邊卡住的條目——集合先算好，
+    # 逐條比對 key 是否在集合內，不改動 rows() 既有的 SQL 過濾邏輯。
+    ready = set(todo_store.ready_keys(con)) if args.ready else None
     for (sid, key, raw, status, sby, sat, _progress, _spec_path,
         _memory_ref) in rows(con, section=args.section, only_doing=args.doing,
                              by=args.by):
+        if ready is not None and key not in ready:
+            continue
         st = todo_store.state_of(con, key)
         print(f'  {sid}  [{st}]{claim_tag(status, sby, sat)} {raw[6:]}')
 
@@ -128,6 +134,24 @@ def cmd_show(con, args):
     print(f'  {r[1]}')
     for line in item_progress_lines(r[6], r[7], r[8], indent='  '):
         print(line)
+    events = todo_store.list_events(con, key)
+    if events:
+        print('  變更軌跡：')
+        for action, old, new, by, at in events:
+            who = f'（by {by}）' if by else ''
+            if action == 'status':
+                print(f'    {at}  status: {old} → {new}{who}')
+            elif action in ('dep_add', 'dep_rm'):
+                # old_value/new_value 存的是 f'{kind}:{key}'，key 是內部
+                # sha1 key（16 碼 hash），不是使用者看得懂的 short_id——
+                # 比照 list_deps() 的既有慣例轉成 short_id 才印，查無條目
+                # （已被刪除）時 fallback 成 key[:8]，不讓查詢直接失敗。
+                raw = new if action == 'dep_add' else old
+                kind, other_key = raw.split(':', 1)
+                sid = con.execute('SELECT short_id FROM todo WHERE key=?',
+                                  (other_key,)).fetchone()
+                other_sid = sid[0] if sid else other_key[:8]
+                print(f'    {at}  {action}: {kind}:{other_sid}{who}')
     # 印出 seq —— edit --line / rm --line 要靠它指名，不顯示就沒法用
     for seq, text in con.execute(
             'SELECT seq, text FROM todo_line WHERE todo_key=? ORDER BY seq',
@@ -249,6 +273,12 @@ def cmd_mark(con, args):
     who = ('（已釋放認領）' if args.status == 'pending'
            else f'（by {args.by}）' if args.by else '')
     print(f'{args.ref} → {args.status}{who}')
+    # 純資訊提示：done/unpick 才可能讓下游解阻塞，pending 本身仍是
+    # blocker，查了也是空結果——不觸發任何會改 status 的呼叫。
+    if args.status in ('done', 'unpick'):
+        unblocked = todo_store.newly_unblocked_after(con, key)
+        if unblocked:
+            print(f'→ 因此變為可動手（無阻塞）：{", ".join(unblocked)}')
 
 
 def cmd_flag(con, args):
@@ -269,6 +299,82 @@ def cmd_flag(con, args):
     if before_status != 'done' and after_status == 'done':
         who = f'（原認領者 {before_by} 保留）' if before_by else ''
         print(f'  → 七旗標全滿，status 自動轉為 done{who}')
+
+
+def cmd_dep(con, args):
+    """依賴關係子指令：`dep list <ref>`／`dep add <from_ref> <kind> <to_ref>`／
+    `dep rm <from_ref> <kind> <to_ref>`。
+
+    kind 的合法值由 argparse 的 `choices=todo_deps.KINDS` 在解析階段就擋掉
+    未知值（exit code 2，錯誤訊息含被拒的字面值），不需要在這裡重複判斷。
+
+    from_ref/to_ref 各自 resolve_ref 失敗時分開 catch KeyError——main() 的
+    通用 handler 只認得單一 `args.ref` 屬性，`dep add`/`dep rm` 卻有兩個
+    ref 參數；若讓例外原樣往上冒，to_ref 查無條目時使用者會看到「查無
+    條目：{from_ref 的值}」這種指錯對象的誤導訊息，所以在此就地攔截、
+    各自印出真正查無的那個 ref。
+
+    resolve_ref() 除了 KeyError 還會拋 AmbiguousRef（同一個 ref 命中多筆
+    條目）——同樣的道理：main() 的通用 handler 只認 args.ref，若讓
+    AmbiguousRef 原樣冒上去，to_ref 命中多筆時使用者會看到「args.ref 命中
+    N 筆」這種指錯對象的誤導訊息，所以比照 KeyError 的作法也在此就地攔截。
+    """
+    if args.action == 'list':
+        key = todo_store.resolve_ref(con, args.ref)
+        sid = con.execute('SELECT short_id FROM todo WHERE key=?',
+                          (key,)).fetchone()[0]
+        deps = todo_store.list_deps(con, key)
+        if not deps:
+            print(f'{sid} 沒有任何依賴關係')
+            return
+        # 同時涵蓋雙方向：out（本條目阻塞誰／指向誰）與 in（誰阻塞本條目／
+        # 誰指向本條目），list_deps() 已把兩個方向都算好，這裡只管排版。
+        for direction, kind, _other_key, other_sid in deps:
+            arrow = (f'{sid} -{kind}-> {other_sid}' if direction == 'out'
+                     else f'{other_sid} -{kind}-> {sid}')
+            print(f'  {arrow}')
+        return
+
+    if args.kind is None or args.to_ref is None:
+        print('dep add/rm 需要三個參數：<from_ref> <kind> <to_ref>',
+              file=sys.stderr)
+        return 5
+
+    try:
+        from_key = todo_store.resolve_ref(con, args.ref)
+    except KeyError:
+        print(f'查無條目：{args.ref}', file=sys.stderr)
+        return 4
+    except todo_store.AmbiguousRef as e:
+        print(f'「{args.ref}」命中 {len(e.candidates)} 筆，請指名：', file=sys.stderr)
+        for sid, key, title in e.candidates:
+            print(f'  {sid}  {title[:60]}', file=sys.stderr)
+        return 3
+    try:
+        to_key = todo_store.resolve_ref(con, args.to_ref)
+    except KeyError:
+        print(f'查無條目：{args.to_ref}', file=sys.stderr)
+        return 4
+    except todo_store.AmbiguousRef as e:
+        print(f'「{args.to_ref}」命中 {len(e.candidates)} 筆，請指名：', file=sys.stderr)
+        for sid, key, title in e.candidates:
+            print(f'  {sid}  {title[:60]}', file=sys.stderr)
+        return 3
+
+    if args.action == 'add':
+        todo_store.add_dep(con, from_key, to_key, args.kind, by=args.by)
+        print(f'{args.ref} -{args.kind}-> {args.to_ref} 已新增')
+    else:
+        # remove_dep() 的 KeyError 是「這條邊不存在」，不是「args.ref 這個
+        # 條目查無」——不能讓它冒到 main() 的通用 except KeyError（那裡只認
+        # args.ref，會印出指錯對象、更容易誤導使用者的訊息）。就地攔截，
+        # 讓 remove_dep() 自己組好的訊息原樣印出。
+        try:
+            todo_store.remove_dep(con, from_key, to_key, args.kind, by=args.by)
+        except KeyError as e:
+            print(e.args[0] if e.args else e, file=sys.stderr)
+            return 4
+        print(f'{args.ref} -{args.kind}-> {args.to_ref} 已刪除')
 
 
 def cmd_add(con, args):
@@ -346,6 +452,7 @@ def cmd_doctor(con, args):
     """
     import todo_audit
     import todo_config
+    import todo_deps
 
     repo = Path.cwd()
     db = db_for(args.project_resolved)
@@ -383,6 +490,32 @@ def cmd_doctor(con, args):
                 print(f'WARN {sid} 的 spec_path 指向不存在的檔案：{spec_path}')
             if memory_ref and not _resolve_ref_path(repo, memory_ref).exists():
                 print(f'WARN {sid} 的 memory_ref 指向不存在的檔案：{memory_ref}')
+
+    # REQ-8：todo_dep 依賴圖完整性 —— 懸空邊（from_key/to_key 指向不存在
+    # 的條目）與環狀依賴，只 WARN 不修復（不刪邊、不斷環），exit code
+    # 仍恆為 0。懸空檢查同時查 from_key 與 to_key 兩側，缺一側會漏掉
+    # 「正常條目被刪除後留下的孤兒邊」這種情況。環檢測依 kind 分開跑
+    # （blocks 一張圖、parent-child 一張圖），related/discovered-from
+    # 是無序或非阻塞語意，不做環檢測。WARN 訊息一律轉成 short_id 呈現，
+    # 不印 todo_dep 表裡的原始 sha1 hash key（不可讀）。
+    if con is not None:
+        for from_key, to_key, kind in con.execute(
+                'SELECT from_key, to_key, kind FROM todo_dep'):
+            for k, role in ((from_key, 'from_key'), (to_key, 'to_key')):
+                if con.execute('SELECT 1 FROM todo WHERE key=?',
+                              (k,)).fetchone() is None:
+                    print(f'WARN todo_dep 有懸空 {role}'
+                          f'（{kind} 邊指向不存在的條目）：{k}')
+        for kind in ('blocks', 'parent-child'):
+            edges = con.execute(
+                'SELECT from_key, to_key FROM todo_dep WHERE kind=?',
+                (kind,)).fetchall()
+            cyc = todo_deps.any_cycle(edges)
+            if cyc:
+                names = ' → '.join(
+                    (con.execute('SELECT short_id FROM todo WHERE key=?',
+                                (k,)).fetchone() or [k])[0] for k in cyc)
+                print(f'WARN {kind} 邊存在環狀依賴：{names}')
 
     defaults = {'search_dirs': list(todo_audit.SEARCH_DIRS),
                'scan_exts': list(todo_audit.SCAN_EXTS)}
@@ -482,6 +615,8 @@ def main():
     # 「session 結束前列出仍掛在自己名下的項目」要能真的查得出來，
     # 而不是查出全體 session 的 doing 讓人自己認
     p.add_argument('--by', help='只列這個認領者的條目')
+    p.add_argument('--ready', action='store_true',
+                   help='只列 pending 且未被 blocks 邊卡住的條目')
     p.set_defaults(fn=cmd_list)
 
     p = sub.add_parser('show', parents=[common])
@@ -540,6 +675,14 @@ def main():
     p.add_argument('op', choices=['set', 'clear', 'toggle'])
     p.add_argument('name', choices=list(todo_flags.FLAGS.keys()))
     p.set_defaults(fn=cmd_flag)
+
+    p = sub.add_parser('dep', parents=[common])
+    p.add_argument('action', choices=['add', 'rm', 'list'])
+    p.add_argument('ref', help='list 時是查詢對象；add/rm 時是 from_ref')
+    p.add_argument('kind', nargs='?', choices=sorted(todo_deps.KINDS))
+    p.add_argument('to_ref', nargs='?')
+    p.add_argument('--by')
+    p.set_defaults(fn=cmd_dep)
 
     p = sub.add_parser('add', parents=[common])
     p.add_argument('title')

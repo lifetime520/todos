@@ -598,5 +598,453 @@ class TestProgressFlagCommand(unittest.TestCase):
         self.assertEqual(item['spec_path'], 'docs/specs/x.md')
 
 
+class TestDepCommand(unittest.TestCase):
+    """`dep add/rm/list` 與 `list --ready` 的 CLI 層行為。
+
+    這一層要驗的是子指令的 exit code 與 stdout/stderr 內容，不是重測
+    todo_store.add_dep/remove_dep/list_deps/ready_keys 本身的邏輯
+    （那些已在 test_store.py 覆蓋）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        audit = self.home / '.claude' / 'todos' / '.audit'
+        audit.mkdir(parents=True)
+        con = todo_store.connect(audit / 'demo.sqlite')
+        todo_store.save_parsed(con, 'demo', todo_store.parse_md_lossless(SAMPLE))
+        todo_store.assign_short_ids(con)
+        con.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    # ---- REQ-1: dep add/rm/list CLI 介面 ----
+
+    # REQ-1
+    def test_dep_add_then_list_shows_relation(self):
+        r = run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run_cli('dep', 'list', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('T-001', r.stdout)
+        self.assertIn('blocks', r.stdout)
+        self.assertIn('T-002', r.stdout)
+
+    # REQ-1: dep list 必須雙向可查 —— 被依賴那一端（to_ref）也要能看到關係，
+    # 不是只有發起依賴那一端（from_ref）才看得到。cmd_dep 的 in/out 分支
+    # 是 CLI 層才有的格式化邏輯，值得獨立驗證。
+    def test_dep_list_shows_incoming_direction_on_target(self):
+        run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('dep', 'list', 'T-002', '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('T-001', r.stdout)
+        self.assertIn('blocks', r.stdout)
+        self.assertIn('T-002', r.stdout)
+
+    # REQ-1：非 0 exit code 必須是「因為 bogus 這個值不合法」，不能只是
+    # 剛好因為別的理由而非 0——單獨斷言 != 0 對還沒有 dep 子指令的當下
+    # 也會巧合通過（argparse 對 'dep' 本身就會報 invalid choice），
+    # 所以額外釘住錯誤內容要指名是 bogus。
+    def test_dep_add_unknown_kind_rejected(self):
+        r = run_cli('dep', 'add', 'T-001', 'bogus', 'T-002',
+                    '--project', 'demo', env_home=self.home)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('bogus', r.stdout + r.stderr)
+
+    # REQ-1：未知 kind 不只要回非 0，還不能悄悄把邊寫進去。
+    def test_dep_add_unknown_kind_does_not_write(self):
+        run_cli('dep', 'add', 'T-001', 'bogus', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('dep', 'list', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertIn('沒有任何依賴關係', r.stdout)
+
+    # REQ-1
+    def test_dep_rm_removes_relation(self):
+        run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('dep', 'rm', 'T-001', 'blocks', 'T-002',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run_cli('dep', 'list', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertIn('沒有任何依賴關係', r.stdout)
+
+    # REQ-1：刪除不存在的邊是錯誤，不是靜默成功（比照 rm --line 的既有慣例）。
+    # 光斷言 != 0 在 dep 子指令還不存在時也會巧合通過，所以另外造一條
+    # 真實存在的 related 邊當對照組——失敗的刪除不該連帶影響它。
+    def test_dep_rm_nonexistent_edge_rejected(self):
+        run_cli('dep', 'add', 'T-001', 'related', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('dep', 'rm', 'T-001', 'blocks', 'T-002',
+                    '--project', 'demo', env_home=self.home)
+        self.assertNotEqual(r.returncode, 0)
+        show = run_cli('dep', 'list', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertIn('related', show.stdout)
+
+    # REQ-1（G-5 裁決）：重複新增同一條邊（from/to/kind 皆相同）視為錯誤，
+    # 不得靜默吞掉——否則打錯 kind 名稱後補一次正確呼叫，會被誤判成
+    # 「這次也失敗了」。
+    # 光斷言 != 0 在 dep 子指令還不存在時也會巧合通過，所以額外驗證
+    # dep list 只列出一條邊，不是被重複插入兩條。
+    def test_dep_add_duplicate_edge_rejected(self):
+        run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                    '--project', 'demo', env_home=self.home)
+        self.assertNotEqual(r.returncode, 0)
+        show = run_cli('dep', 'list', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertEqual(show.stdout.count('blocks'), 1)
+
+    # REQ-1：from_ref 查無條目時，CLI 層要報錯而不是把不存在的 ref 當成
+    # 有效 key 寫進 todo_dep（那會留下指向不存在條目的孤兒邊）。
+    # 光斷言 != 0 在 dep 子指令還不存在時也會巧合通過，所以額外驗證
+    # T-001（存在的那一端）沒有被留下任何孤兒邊。
+    def test_dep_add_missing_from_ref_errors(self):
+        r = run_cli('dep', 'add', 'T-999', 'blocks', 'T-001',
+                    '--project', 'demo', env_home=self.home)
+        self.assertNotEqual(r.returncode, 0)
+        show = run_cli('dep', 'list', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertIn('沒有任何依賴關係', show.stdout)
+
+    # REQ-1：to_ref 查無條目時同上。
+    def test_dep_add_missing_to_ref_errors(self):
+        r = run_cli('dep', 'add', 'T-001', 'blocks', 'T-999',
+                    '--project', 'demo', env_home=self.home)
+        self.assertNotEqual(r.returncode, 0)
+        show = run_cli('dep', 'list', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertIn('沒有任何依賴關係', show.stdout)
+
+    # ---- REQ-2: CLI 層環狀依賴拒絕 ----
+
+    # REQ-2
+    def test_dep_add_cycle_rejected_with_message(self):
+        run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('dep', 'add', 'T-002', 'blocks', 'T-001',
+                    '--project', 'demo', env_home=self.home)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('環', r.stderr)
+
+    # REQ-2：驗收判準明講「至少 A、B 兩個 short_id」，不是空泛的「有環」。
+    def test_dep_add_cycle_message_contains_both_short_ids(self):
+        run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('dep', 'add', 'T-002', 'blocks', 'T-001',
+                    '--project', 'demo', env_home=self.home)
+        self.assertIn('T-001', r.stderr)
+        self.assertIn('T-002', r.stderr)
+
+    # REQ-2：自我依賴（A blocks A）是環的最小情況（長度 1 的環路徑），
+    # 即使沒有任何既有邊也該被擋下——這是前兩個 task 的收件複審點名
+    # 「自我依賴邊界」容易被 brief 建議測試漏掉的地方。
+    def test_dep_add_self_blocks_dependency_rejected(self):
+        r = run_cli('dep', 'add', 'T-001', 'blocks', 'T-001',
+                    '--project', 'demo', env_home=self.home)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('環', r.stderr)
+
+    # REQ-2：related 明文排除在環檢測之外，A related B 後 B related A
+    # 必須成功，不能被誤判成環。
+    def test_dep_add_related_reverse_not_treated_as_cycle(self):
+        r = run_cli('dep', 'add', 'T-001', 'related', 'T-002',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run_cli('dep', 'add', 'T-002', 'related', 'T-001',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    # REQ-2：discovered-from 同樣排除在環檢測之外，requirements.md 原文
+    # 明講 related／discovered-from 兩者都不做此檢查，只測 related 會漏掉
+    # discovered-from 若被誤接進環檢測的情況。
+    def test_dep_add_discovered_from_reverse_not_treated_as_cycle(self):
+        r = run_cli('dep', 'add', 'T-001', 'discovered-from', 'T-002',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run_cli('dep', 'add', 'T-002', 'discovered-from', 'T-001',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    # REQ-2：parent-child 與 blocks 同樣要做環檢測，不是只有 blocks。
+    def test_dep_add_parent_child_cycle_also_rejected(self):
+        run_cli('dep', 'add', 'T-001', 'parent-child', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('dep', 'add', 'T-002', 'parent-child', 'T-001',
+                    '--project', 'demo', env_home=self.home)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('環', r.stderr)
+
+    # REQ-2（G-3 裁決）：blocks 與 parent-child 分開跑環檢測，不合併成
+    # 同一張圖。T-001 是 T-002 的 parent，T-002 又 blocks T-001（子任務
+    # 卡住父任務完成）——這是合法且常見的模式，合併成同一張圖會把它
+    # 誤判成死鎖而拒絕寫入。這正是需求文件點名要求測試作者提高警覺的
+    # 「圖獨立性」缺口。
+    def test_dep_add_parent_child_and_blocks_graphs_independent(self):
+        r = run_cli('dep', 'add', 'T-001', 'parent-child', 'T-002',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run_cli('dep', 'add', 'T-002', 'blocks', 'T-001',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    # ---- REQ-3: list --ready CLI 介面 ----
+
+    # REQ-3
+    def test_list_ready_excludes_blocked_item(self):
+        run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('list', '--ready', '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('T-001', r.stdout)
+        self.assertNotIn('T-002', r.stdout)
+
+    # REQ-3：驗收判準的另一半——A 完成後 B 不再被卡住，必須出現在
+    # list --ready 裡。只測「還沒完成時排除」會漏掉「完成後回到清單」
+    # 這個方向。
+    def test_list_ready_item_becomes_ready_after_blocker_done(self):
+        run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        run_cli('mark', 'T-001', 'done', '--project', 'demo', env_home=self.home)
+        r = run_cli('list', '--ready', '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('T-002', r.stdout)
+
+    # REQ-3：只有 blocks 邊會卡住 ready 判定。related 邊不該讓另一端從
+    # list --ready 消失。
+    def test_list_ready_related_kind_does_not_block(self):
+        run_cli('dep', 'add', 'T-001', 'related', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('list', '--ready', '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('T-001', r.stdout)
+        self.assertIn('T-002', r.stdout)
+
+
+class TestMarkUnblockHint(unittest.TestCase):
+    """`mark <ref> done/unpick` 之後的解阻塞提示（REQ-4）。
+
+    這一層要驗的是 cmd_mark 的 stdout 呈現與「純資訊、不觸發自動轉態」
+    這個核心不變式；`newly_unblocked_after` 本身的圖論邏輯已在
+    test_store.py 覆蓋，這裡不重測。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        audit = self.home / '.claude' / 'todos' / '.audit'
+        audit.mkdir(parents=True)
+        con = todo_store.connect(audit / 'demo.sqlite')
+        todo_store.save_parsed(con, 'demo', todo_store.parse_md_lossless(SAMPLE))
+        todo_store.assign_short_ids(con)
+        con.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _db(self):
+        return todo_store.connect(
+            self.home / '.claude' / 'todos' / '.audit' / 'demo.sqlite')
+
+    # REQ-4：核心驗收判準——印出提示的同一時刻，下游條目的 status 必須
+    # 原封不動地留在 pending。只斷言 stdout 含 short_id 會漏掉「提示印了，
+    # 但背地裡把下游偷偷轉態」這種假紅測試抓不到的 bug，所以額外查 DB。
+    def test_mark_done_prints_hint_and_leaves_downstream_status_pending(self):
+        run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('mark', 'T-001', 'done', '--project', 'demo',
+                    env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('T-002', r.stdout)
+        self.assertIn('可動手', r.stdout)
+        con = self._db()
+        row = con.execute("SELECT status, status_by FROM todo"
+                          " WHERE short_id='T-002'").fetchone()
+        con.close()
+        self.assertEqual(row[0], 'pending')
+        self.assertIsNone(row[1])
+
+    # REQ-4：驗收判準明講 done 與 unpick 兩者都要觸發提示，只測 done
+    # 會漏掉 unpick 這一半（例如實作只在 status == 'done' 判斷，漏了
+    # 'unpick' 分支）。
+    def test_mark_unpick_prints_hint_and_leaves_downstream_status_pending(self):
+        run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('mark', 'T-001', 'unpick', '--note', '不做了',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('T-002', r.stdout)
+        self.assertIn('可動手', r.stdout)
+        con = self._db()
+        row = con.execute("SELECT status FROM todo"
+                          " WHERE short_id='T-002'").fetchone()
+        con.close()
+        self.assertEqual(row[0], 'pending')
+
+    # REQ-4（G-2 裁決）：pending 不觸發解阻塞提示查詢——可觀察行為是
+    # stdout 不印「可動手」。
+    def test_mark_pending_never_prints_unblock_hint(self):
+        run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        run_cli('mark', 'T-001', 'doing', '--by', 'sess-a',
+                '--project', 'demo', env_home=self.home)
+        # 釋放自己的認領需要 --by 指名（比照既有 CLAUDE.md 操作手冊：
+        # `mark <ref> pending --by <誰>`），否則會被 ClaimConflict 擋下，
+        # 那是另一回事，不是這個測試要驗的行為。
+        r = run_cli('mark', 'T-001', 'pending', '--by', 'sess-a',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('可動手', r.stdout)
+
+    # REQ-4：沒有任何下游因此變 ready 時，不該印出提示行——否則每次
+    # mark done 都洗一行空提示，會讓「真的有事要看」跟「例行公事」
+    # 混在一起分不出來。
+    def test_mark_done_with_no_downstream_omits_unblock_line(self):
+        r = run_cli('mark', 'T-001', 'done', '--project', 'demo',
+                    env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('可動手', r.stdout)
+
+    # REQ-4：直接下游還有其他未完成的 blocker 時，不該被列入「因此變
+    # 可動手」——這是最容易被實作者漏掉的一格：naive 實作可能只看
+    # 「done_key 直接指向的下游」而不檢查該下游是否還被別的邊卡著。
+    def test_mark_done_does_not_list_downstream_with_remaining_blocker(self):
+        add = run_cli('add', '第三條', '🏷️  x', '💡  y',
+                      '--project', 'demo', env_home=self.home)
+        t3 = add.stdout.strip()
+        run_cli('dep', 'add', 'T-001', 'blocks', t3,
+                '--project', 'demo', env_home=self.home)
+        run_cli('dep', 'add', 'T-002', 'blocks', t3,
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('mark', 'T-001', 'done', '--project', 'demo',
+                    env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn(t3, r.stdout)
+        con = self._db()
+        row = con.execute('SELECT status FROM todo WHERE short_id=?',
+                          (t3,)).fetchone()
+        con.close()
+        self.assertEqual(row[0], 'pending')
+
+    # REQ-4：下游本身已經不是 pending（例如已被人認領 doing）時，即使
+    # 唯一的 blocker 完成了，也不該被當成「因此變可動手」——ready 的
+    # 定義是「pending 且未被卡住」，doing 中的條目不該混進提示裡。
+    def test_mark_done_does_not_list_non_pending_downstream(self):
+        run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        run_cli('mark', 'T-002', 'doing', '--by', 'sess-b',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('mark', 'T-001', 'done', '--project', 'demo',
+                    env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('可動手', r.stdout)
+
+
+class TestShowChangeHistory(unittest.TestCase):
+    """`show <ref>` 的變更軌跡段落（REQ-6）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        audit = self.home / '.claude' / 'todos' / '.audit'
+        audit.mkdir(parents=True)
+        con = todo_store.connect(audit / 'demo.sqlite')
+        todo_store.save_parsed(con, 'demo', todo_store.parse_md_lossless(SAMPLE))
+        todo_store.assign_short_ids(con)
+        con.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    # REQ-6：轉態事件要含轉態前後值與操作者，缺任何一項都讓「覆盤撞車
+    # 事故」這個目的落空。
+    def test_show_lists_status_transition_with_old_new_and_owner(self):
+        run_cli('mark', 'T-001', 'doing', '--by', 'sess-a',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('show', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('變更軌跡', r.stdout)
+        self.assertIn('pending → doing', r.stdout)
+        self.assertIn('sess-a', r.stdout)
+
+    # REQ-6：從沒發生過任何轉態／依賴變更的條目，不該印出空的「變更
+    # 軌跡：」標頭——那會讓人誤以為有記錄可看，點進去卻是空的。
+    def test_show_omits_change_history_section_when_no_events(self):
+        r = run_cli('show', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('變更軌跡', r.stdout)
+
+    # REQ-6：驗收判準明講「至少涵蓋 status 轉換...與依賴增刪兩類事件」，
+    # 只測 status 轉換會漏掉依賴事件完全沒進軌跡的情況。
+    def test_show_change_history_includes_dep_add_event(self):
+        run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('show', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('變更軌跡', r.stdout)
+        history = r.stdout.split('變更軌跡', 1)[1]
+        self.assertIn('T-002', history)
+
+    # REQ-6：dep_rm 同樣屬於驗收判準點名的「依賴增刪兩類事件」之一，
+    # 只測 dep_add 會漏掉刪除這一半（例如實作只在 cmd_dep 的 add 分支
+    # 呼叫 _record_event，rm 分支漏寫）。
+    def test_show_change_history_includes_dep_rm_event(self):
+        run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        run_cli('dep', 'rm', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('show', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('變更軌跡', r.stdout)
+        history = r.stdout.split('變更軌跡', 1)[1]
+        # dep_add 與 dep_rm 兩筆都要留下獨立記錄（append-only），
+        # 不是刪除後只剩空白。
+        self.assertEqual(history.count('T-002'), 2)
+
+    # REQ-6：驗收判準明講「由新到舊排序」——依序做 doing → done →
+    # dep add 三個動作，軌跡裡最後發生的（dep add）必須排在最前面，
+    # 最早發生的（doing）排在最後面。
+    def test_show_change_history_ordered_newest_first(self):
+        run_cli('mark', 'T-001', 'doing', '--by', 'sess-a',
+                '--project', 'demo', env_home=self.home)
+        # 轉 done 要帶同一個 --by，否則會被既有認領守衛以 ClaimConflict
+        # 擋下（set_status() 只認「當前 doing 的擁有者」，見 test_store.py
+        # 的 TestClaimGuard；Task 2 的 QA 曾在 test_list_events_orders_
+        # newest_first 踩過同一個坑，這裡是同一類錯誤）。
+        run_cli('mark', 'T-001', 'done', '--by', 'sess-a',
+                '--project', 'demo', env_home=self.home)
+        run_cli('dep', 'add', 'T-001', 'blocks', 'T-002',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('show', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('變更軌跡', r.stdout)
+        history = r.stdout.split('變更軌跡', 1)[1]
+        idx_dep = history.index('T-002')
+        idx_done = history.index('doing → done')
+        idx_doing = history.index('pending → doing')
+        self.assertLess(idx_dep, idx_done,
+                        '最新的 dep_add 事件必須排在較早的 status 事件之前')
+        self.assertLess(idx_done, idx_doing,
+                        'done 轉態必須排在更早的 doing 轉態之前')
+
+    # REQ-6 + REQ-7：被 ClaimConflict 擋下的轉態嘗試不寫入變更軌跡——
+    # sess-b 的嘗試被拒絕，show 的變更軌跡裡不該出現 sess-b 這個操作者，
+    # 只有 sess-a 成功那筆。這是 CLI 層的整合驗證：即使 store 層的
+    # _record_event 沒被呼叫，也要確認 cmd_show 沒有另外用什麼方式
+    # 把被拒絕的嘗試呈現出來。
+    def test_show_change_history_excludes_rejected_claim_attempt(self):
+        run_cli('mark', 'T-001', 'doing', '--by', 'sess-a',
+                '--project', 'demo', env_home=self.home)
+        conflict = run_cli('mark', 'T-001', 'doing', '--by', 'sess-b',
+                           '--project', 'demo', env_home=self.home)
+        self.assertEqual(conflict.returncode, 7, conflict.stdout + conflict.stderr)
+        r = run_cli('show', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('變更軌跡', r.stdout)
+        history = r.stdout.split('變更軌跡', 1)[1]
+        self.assertNotIn('sess-b', history)
+        self.assertEqual(history.count('pending → doing'), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

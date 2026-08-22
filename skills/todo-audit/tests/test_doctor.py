@@ -800,5 +800,234 @@ class TestDoctorDanglingRefs(unittest.TestCase):
         self.assertNotIn('ok.md', r.stdout.replace('OK', ''))
 
 
+class TestDoctorDependencyIntegrity(unittest.TestCase):
+    """REQ-8：doctor 檢查 todo_dep 的懸空邊與環狀依賴，只 WARN 不修復。
+
+    懸空邊／環都是直接寫原生 SQL 造出來的「已經壞掉」資料 —— 正常路徑
+    （`todo_store.add_dep()`）本身會擋掉不存在的 key 與環，所以要模擬
+    「已經壞掉的資料」（人工改 DB、舊版程式漏檢查留下的殘局）只能繞過
+    它直接 INSERT，這與 brief 的作法一致。
+
+    每個測試都聚焦一件事：懸空邊分 from_key／to_key 兩種角色分別驗證
+    （避免只檢查其中一側的實作被誤判為完整）；環另外驗證 WARN 訊息用
+    的是可讀的 short_id 而非不可讀的原始 hash key（沿用上一個 task 在
+    收件檢查中發現的同類缺陷：印出 hash 而非人類可讀識別碼）；REQ-8
+    「只 WARN 不修復」的核心——DB 在 doctor 跑完後原封不動——每種問題
+    都各自有一條測試直接查 DB 驗證，不是只驗證 stdout 有沒有字樣。
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        tmp = Path(self._tmpdir.name)
+        self.home = tmp / 'home'
+        self.repo = tmp / 'repo'
+        self.repo.mkdir(parents=True)
+        self.db = _init_db(self.home, 'demo')
+
+    def _insert_raw_dep(self, con, from_key, to_key, kind='blocks'):
+        con.execute(
+            "INSERT INTO todo_dep(from_key,to_key,kind,created_at,created_by)"
+            " VALUES(?,?,?,?,?)", (from_key, to_key, kind, 'now', None))
+
+    def _warn_lines(self, out):
+        return [l for l in out.splitlines()
+                if PREFIX_RE.match(l) and PREFIX_RE.match(l).group(1) == 'WARN']
+
+    # REQ-8：to_key 指向不存在的條目要被 WARN，且訊息帶出懸空的 key。
+    def test_dangling_to_key_warns_with_key(self):
+        con = todo_store.connect(self.db)
+        sid = todo_store.append_item(con, 'demo', '測試條目', '', '')
+        key = con.execute('SELECT key FROM todo WHERE short_id=?',
+                          (sid,)).fetchone()[0]
+        self._insert_raw_dep(con, key, 'ghost-to-key')
+        con.commit()
+        con.close()
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        out = r.stdout + r.stderr
+        hit = [l for l in self._warn_lines(out) if 'ghost-to-key' in l]
+        self.assertTrue(hit, f'找不到懸空 to_key 的 WARN 行：\n{out}')
+
+    # REQ-8：from_key 指向不存在的條目同樣要被 WARN（不能只檢查 to_key
+    # 那一側 —— 兩個角色都要各自查存在性）。
+    def test_dangling_from_key_warns_with_key(self):
+        con = todo_store.connect(self.db)
+        sid = todo_store.append_item(con, 'demo', '測試條目', '', '')
+        key = con.execute('SELECT key FROM todo WHERE short_id=?',
+                          (sid,)).fetchone()[0]
+        self._insert_raw_dep(con, 'ghost-from-key', key)
+        con.commit()
+        con.close()
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        out = r.stdout + r.stderr
+        hit = [l for l in self._warn_lines(out) if 'ghost-from-key' in l]
+        self.assertTrue(hit, f'找不到懸空 from_key 的 WARN 行：\n{out}')
+
+    # REQ-8 核心：doctor 對懸空邊只 WARN，不得刪除 —— 直接查 DB 而非只看
+    # stdout，證明「跑完 doctor 後該筆懸空邊仍存在於 DB」。
+    def test_dangling_edge_survives_doctor_unmodified(self):
+        con = todo_store.connect(self.db)
+        sid = todo_store.append_item(con, 'demo', '測試條目', '', '')
+        key = con.execute('SELECT key FROM todo WHERE short_id=?',
+                          (sid,)).fetchone()[0]
+        self._insert_raw_dep(con, key, 'ghost-survives')
+        con.commit()
+        con.close()
+        run_cli('doctor', '--project', 'demo', env_home=self.home, cwd=self.repo)
+        con = todo_store.connect(self.db)
+        row = con.execute(
+            "SELECT COUNT(*) FROM todo_dep WHERE from_key=? AND to_key=?"
+            " AND kind='blocks'", (key, 'ghost-survives')).fetchone()
+        con.close()
+        self.assertEqual(row[0], 1,
+                         'doctor 是診斷工具，不得刪除懸空邊——REQ-8 只 WARN 不修復')
+
+    # REQ-8：即使發現懸空邊，doctor 的 exit code 仍恆為 0。
+    def test_dangling_edge_doctor_exit_code_zero(self):
+        con = todo_store.connect(self.db)
+        sid = todo_store.append_item(con, 'demo', '測試條目', '', '')
+        key = con.execute('SELECT key FROM todo WHERE short_id=?',
+                          (sid,)).fetchone()[0]
+        self._insert_raw_dep(con, key, 'ghost-exit-zero')
+        con.commit()
+        con.close()
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    # REQ-8：blocks 邊構成的環要被 WARN，且訊息用可讀的 short_id
+    # （T-NNN），不是不可讀的原始 sha1 hash key —— 上一個 task 的收件
+    # 檢查發現過同類缺陷（依賴事件印成 hash），這裡直接釘住不重蹈覆轍。
+    def test_cyclic_blocks_warns_with_readable_short_ids_not_raw_keys(self):
+        con = todo_store.connect(self.db)
+        a = todo_store.append_item(con, 'demo', 'A', '', '')
+        b = todo_store.append_item(con, 'demo', 'B', '', '')
+        ak = con.execute('SELECT key FROM todo WHERE short_id=?',
+                         (a,)).fetchone()[0]
+        bk = con.execute('SELECT key FROM todo WHERE short_id=?',
+                         (b,)).fetchone()[0]
+        for f, t in ((ak, bk), (bk, ak)):
+            self._insert_raw_dep(con, f, t, 'blocks')
+        con.commit()
+        con.close()
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        out = r.stdout + r.stderr
+        cyc_lines = [l for l in self._warn_lines(out) if '環' in l]
+        self.assertTrue(cyc_lines, f'找不到環狀依賴的 WARN 行：\n{out}')
+        combined = '\n'.join(cyc_lines)
+        self.assertIn(a, combined, 'WARN 訊息必須用可讀的 short_id 呈現環路徑')
+        self.assertIn(b, combined, 'WARN 訊息必須用可讀的 short_id 呈現環路徑')
+        self.assertNotIn(ak, combined, 'WARN 訊息不該印出不可讀的原始 hash key')
+        self.assertNotIn(bk, combined, 'WARN 訊息不該印出不可讀的原始 hash key')
+
+    # REQ-8 核心：doctor 對環狀依賴只 WARN，不得斷開（刪除任何一條邊）
+    # —— 直接查 DB，兩條邊都要還在。
+    def test_cyclic_blocks_edges_survive_doctor_unmodified(self):
+        con = todo_store.connect(self.db)
+        a = todo_store.append_item(con, 'demo', 'A', '', '')
+        b = todo_store.append_item(con, 'demo', 'B', '', '')
+        ak = con.execute('SELECT key FROM todo WHERE short_id=?',
+                         (a,)).fetchone()[0]
+        bk = con.execute('SELECT key FROM todo WHERE short_id=?',
+                         (b,)).fetchone()[0]
+        for f, t in ((ak, bk), (bk, ak)):
+            self._insert_raw_dep(con, f, t, 'blocks')
+        con.commit()
+        con.close()
+        run_cli('doctor', '--project', 'demo', env_home=self.home, cwd=self.repo)
+        con = todo_store.connect(self.db)
+        count = con.execute(
+            "SELECT COUNT(*) FROM todo_dep WHERE kind='blocks'").fetchone()[0]
+        con.close()
+        self.assertEqual(count, 2,
+                         'doctor 不得為了「解環」而刪除任何一條 blocks 邊')
+
+    # REQ-8 + G-3：parent-child 邊構成的環也要被獨立偵測到（不是只查
+    # blocks 這一種 kind）。
+    def test_cyclic_parent_child_also_warns(self):
+        con = todo_store.connect(self.db)
+        a = todo_store.append_item(con, 'demo', 'P', '', '')
+        b = todo_store.append_item(con, 'demo', 'C', '', '')
+        ak = con.execute('SELECT key FROM todo WHERE short_id=?',
+                         (a,)).fetchone()[0]
+        bk = con.execute('SELECT key FROM todo WHERE short_id=?',
+                         (b,)).fetchone()[0]
+        for f, t in ((ak, bk), (bk, ak)):
+            self._insert_raw_dep(con, f, t, 'parent-child')
+        con.commit()
+        con.close()
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        out = r.stdout + r.stderr
+        cyc_lines = [l for l in self._warn_lines(out) if '環' in l]
+        self.assertTrue(cyc_lines,
+                        f'parent-child 邊構成的環也應該被 WARN：\n{out}')
+
+    # REQ-8 + G-3：related 是無序語意，即使兩個方向都寫了邊，也不該被
+    # 誤判成環（環檢測只適用 blocks/parent-child）。
+    def test_related_kind_reciprocal_edges_not_flagged_as_cycle(self):
+        con = todo_store.connect(self.db)
+        a = todo_store.append_item(con, 'demo', 'A', '', '')
+        b = todo_store.append_item(con, 'demo', 'B', '', '')
+        ak = con.execute('SELECT key FROM todo WHERE short_id=?',
+                         (a,)).fetchone()[0]
+        bk = con.execute('SELECT key FROM todo WHERE short_id=?',
+                         (b,)).fetchone()[0]
+        for f, t in ((ak, bk), (bk, ak)):
+            self._insert_raw_dep(con, f, t, 'related')
+        con.commit()
+        con.close()
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        out = r.stdout + r.stderr
+        self.assertNotIn('環', out,
+                         'related 邊是無序語意，doctor 不該對它做環狀依賴檢查')
+
+    # 反例：透過正常路徑（add_dep）建立的乾淨依賴，不該產生任何懸空／
+    # 環狀依賴的 WARN。
+    def test_clean_dep_via_add_dep_produces_no_dependency_warn(self):
+        con = todo_store.connect(self.db)
+        a = todo_store.append_item(con, 'demo', 'A', '', '')
+        b = todo_store.append_item(con, 'demo', 'B', '', '')
+        ak = con.execute('SELECT key FROM todo WHERE short_id=?',
+                         (a,)).fetchone()[0]
+        bk = con.execute('SELECT key FROM todo WHERE short_id=?',
+                         (b,)).fetchone()[0]
+        todo_store.add_dep(con, ak, bk, 'blocks')
+        con.close()
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = r.stdout + r.stderr
+        self.assertNotIn('懸空', out)
+        self.assertNotIn('環', out)
+
+    # REQ-8：懸空邊與環狀依賴同時存在時，doctor 仍要跑完全部檢查、
+    # exit code 仍恆為 0（不因發現多個問題而提前中止或非零退出）。
+    def test_doctor_exit_code_zero_with_both_dangling_and_cycle(self):
+        con = todo_store.connect(self.db)
+        a = todo_store.append_item(con, 'demo', 'A', '', '')
+        b = todo_store.append_item(con, 'demo', 'B', '', '')
+        ak = con.execute('SELECT key FROM todo WHERE short_id=?',
+                         (a,)).fetchone()[0]
+        bk = con.execute('SELECT key FROM todo WHERE short_id=?',
+                         (b,)).fetchone()[0]
+        for f, t in ((ak, bk), (bk, ak)):
+            self._insert_raw_dep(con, f, t, 'blocks')
+        self._insert_raw_dep(con, ak, 'ghost-combo', 'blocks')
+        con.commit()
+        con.close()
+        r = run_cli('doctor', '--project', 'demo',
+                    env_home=self.home, cwd=self.repo)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = r.stdout + r.stderr
+        self.assertIn('ghost-combo', out)
+        self.assertTrue(self._warn_lines(out), f'應同時印出多行 WARN：\n{out}')
+
+
 if __name__ == '__main__':
     unittest.main()
