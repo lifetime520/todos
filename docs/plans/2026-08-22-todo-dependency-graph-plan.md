@@ -6,7 +6,7 @@
 
 **Architecture:** 新增一個不碰 DB 的純函式模組 `todo_deps.py`（kind 驗證、環狀依賴偵測、ready 判斷、下游解阻塞計算），比照 `todo_flags.py` 的隔離原則；`todo_store.py` 新增 `todo_dep`／`todo_event` 兩張表與對應的 CRUD／查詢函式，並在既有 `set_status()` 掛上事件記錄；`todo_cli.py` 新增 `dep` 子指令、`list --ready`，並在 `mark done`／`show`／`doctor` 各自掛上對應的顯示與檢查邏輯。
 
-**Tech Stack:** Python 3、sqlite3、argparse、pytest（沿用既有 stack，不引入新依賴）
+**Tech Stack:** Python 3、sqlite3、argparse、標準庫 unittest（沿用既有 stack，不引入新依賴；本機無 pytest，一律用 `python3 -m unittest`）
 
 **Spec:** `docs/specs/2026-08-22-todo-dependency-graph-design.md`
 
@@ -15,8 +15,10 @@
 - 既有 `status` 欄位（`pending`/`doing`/`done`/`unpick`）語意與互斥性完全不變；`blocked` **不**新增為 `status` 的第五個值，是依賴圖算出的動態視圖
 - `todo_dep.kind` 合法值僅 `blocks`/`related`/`parent-child`/`discovered-from`，未知值一律 `raise ValueError`（比照 `todo_flags.py` 對未知 `name` 的既有處理方式）
 - 只有 `blocks`/`parent-child` 兩種邊在寫入時做環狀依賴檢查；`related`/`discovered-from` 是純資訊性關聯，不構成執行順序，不檢查
+- `blocks` 與 `parent-child` 的環狀依賴檢查**分開**跑，不合併成同一張圖——兩種邊語意不同，父任務被自己子任務的 `blocks` 邊卡住是合法情境，合併檢測會把它誤判成死鎖（見 requirements.md Stage 2 裁決 G-3）
 - 偵測到環狀依賴時，錯誤訊息必須附上具體的環路徑（用 short_id 呈現），不是「有環」三個字
-- `todo_event` 只記**真正發生**的變更——被 `ClaimConflict` 擋下的轉態、被環狀依賴拒絕的 `dep add` 都不寫事件，避免軌跡表混進雜訊
+- 重複新增同一條邊（`from_key`+`to_key`+`kind` 皆相同）視為錯誤，`raise ValueError` 附可讀訊息，不得靜默忽略（見 G-5）
+- `todo_event` 只記**真正發生**的變更——被 `ClaimConflict` 擋下的轉態、被環狀依賴或重複邊拒絕的 `dep add` 都不寫事件，避免軌跡表混進雜訊
 - `mark done`/`mark unpick` 之後印出的「因此變可動手」清單是**純資訊提示**，不觸發任何自動狀態變更——動不動手仍由人決定
 - `doctor` 新增的懸空依賴／環狀依賴檢查**只 WARN，不 `--fix`**——稽核只給證據，不自動修
 - `set_progress()` 的自動轉 `done` 觸發（既有邏輯）本次**不**寫 `todo_event`——維持 spec 定義的 MVP 範圍（只涵蓋透過 `set_status()` 的轉態），如需涵蓋屬於未來的獨立任務
@@ -38,9 +40,37 @@
 | `skills/todo-audit/tests/test_doctor.py` | 修改 | doctor 懸空依賴／環狀依賴 WARN 測試 |
 | `docs/TODO-SYSTEM.md` | 修改 | 補文件：`dep` 指令、`list --ready`、變更軌跡格式 |
 
+## 不相交檢查與 commit 單元（CastPower Stage 3）
+
+六個 task 的「產品碼 ∪ 測試檔」兩兩取交集：
+
+| Task | 產品碼 | 測試檔 |
+|---|---|---|
+| 1 | `todo_deps.py` | `test_deps.py` |
+| 2 | `todo_store.py` | `test_store.py` |
+| 3 | `todo_cli.py` | `test_cli.py` |
+| 4 | `todo_cli.py` | `test_cli.py` |
+| 5 | `todo_cli.py` | `test_doctor.py` |
+| 6 | `docs/TODO-SYSTEM.md` | — |
+
+Task 1、2、6 與其餘任一 task 皆不相交，各自獨立可並行、可獨立 commit。
+**Task 3/4/5 三者共用 `todo_cli.py`，Task 3/4 額外共用 `test_cli.py`——三者合併成
+一個 commit 單元**（不因此改變任務拆解本身：三個 task 仍照原順序依序執行、各自
+有獨立的 brief 與 RED→GREEN 循環，只有 stage 6 的 `git add`／commit 範圍要把三者
+的產品碼與測試檔一起下，不能拆三次 commit）。
+
+**並行組：** `[Task 1]`、`[Task 2]`（Task 2 消費 Task 1 的介面，需等 Task 1 完成
+GREEN 後才能開始，故非真正並行，但兩者檔案不相交，允許 Task 1 的 4a/4b 與提前
+準備 Task 2 的 4a 重疊）。Task 3/4/5 因**依序消費前一個的介面**且共用檔案，
+一律序列執行。Task 6 依賴全部程式碼落地，最後執行。
+
+**commit 單元順序：** `[Task 1]` → `[Task 2]` → `[Task 3+4+5 合併]` → `[Task 6]`。
+
 ---
 
 ### Task 1: `todo_deps.py` —— 依賴圖純函式模組
+
+**Covers:** REQ-1（kind 驗證邏輯本體）, REQ-2（環偵測函式）, REQ-10（純函式模組本身）
 
 **Files:**
 - Create: `skills/todo-audit/scripts/todo_deps.py`
@@ -159,7 +189,7 @@ if __name__ == '__main__':
 
 - [ ] **Step 2: 確認測試失敗（模組還不存在）**
 
-Run: `cd /var/repos/todos && python3 -m pytest skills/todo-audit/tests/test_deps.py -v`
+Run: `cd skills/todo-audit && python3 -m unittest tests.test_deps -v`
 Expected: FAIL，`ModuleNotFoundError: No module named 'todo_deps'`
 
 - [ ] **Step 3: 實作 `todo_deps.py`**
@@ -271,7 +301,7 @@ def newly_unblocked(done_key, all_edges, all_statuses):
 
 - [ ] **Step 4: 確認測試通過**
 
-Run: `cd /var/repos/todos && python3 -m pytest skills/todo-audit/tests/test_deps.py -v`
+Run: `cd skills/todo-audit && python3 -m unittest tests.test_deps -v`
 Expected: PASS，17 個測試全綠
 
 - [ ] **Step 5: Commit**
@@ -295,13 +325,15 @@ EOF
 
 ### Task 2: `todo_store.py` —— schema、依賴 CRUD、變更軌跡
 
+**Covers:** REQ-1（`add_dep`/`remove_dep`）, REQ-2（環偵測整合）, REQ-3（`ready_keys`/`is_ready`）, REQ-5（驗證 `set_status` 不新增狀態值）, REQ-6（`todo_event` 表與寫入）, REQ-7（衝突不寫事件）, REQ-9（schema idempotent）；另修正 G-5（重複邊報錯）、G-6（`edit_title` 遷移新表）兩項 Stage 2 缺口
+
 **Files:**
 - Modify: `skills/todo-audit/scripts/todo_store.py`（`BASE_SCHEMA`、import、新增函式、`set_status` 掛事件）
 - Test: `skills/todo-audit/tests/test_store.py`
 
 **Interfaces:**
 - Consumes：Task 1 的 `todo_deps.validate_kind`/`find_cycle`/`any_cycle`/`is_ready`/`newly_unblocked`
-- Produces：`add_dep(con, from_key, to_key, kind, by=None) -> None`（未知 kind/key `raise ValueError`/`KeyError`，環狀依賴 `raise ValueError` 附路徑）、`remove_dep(con, from_key, to_key, kind, by=None) -> None`（不存在 `raise KeyError`）、`list_deps(con, key) -> list[tuple]`（`(direction, kind, other_key, other_short_id)`，`direction` ∈ `'in'`/`'out'`）、`is_ready(con, key) -> bool`、`ready_keys(con) -> list[str]`、`newly_unblocked_after(con, key) -> list[str]`（回傳 short_id 清單）、`list_events(con, key) -> list[tuple]`（`(action, old_value, new_value, by, at)`，新到舊）。DB 新增 `todo_dep`、`todo_event` 兩張表。`set_status()` 成功轉態後多寫一筆 `todo_event`。
+- Produces：`add_dep(con, from_key, to_key, kind, by=None) -> None`（未知 kind/key `raise ValueError`/`KeyError`，環狀依賴或重複邊 `raise ValueError` 附可讀訊息）、`remove_dep(con, from_key, to_key, kind, by=None) -> None`（不存在 `raise KeyError`）、`list_deps(con, key) -> list[tuple]`（`(direction, kind, other_key, other_short_id)`，`direction` ∈ `'in'`/`'out'`）、`is_ready(con, key) -> bool`、`ready_keys(con) -> list[str]`、`newly_unblocked_after(con, key) -> list[str]`（回傳 short_id 清單）、`list_events(con, key) -> list[tuple]`（`(action, old_value, new_value, by, at)`，新到舊）。DB 新增 `todo_dep`、`todo_event` 兩張表。`set_status()` 成功轉態後多寫一筆 `todo_event`。**同時修正既有 `edit_title()`**：換 key 時一併遷移 `todo_dep`（`from_key`/`to_key` 各自 `UPDATE`）與 `todo_event`（併入 `_KEYED_TABLES`）（見 requirements.md Stage 2 裁決 G-5、G-6）。
 
 - [ ] **Step 1: 寫失敗測試（附加到 `test_store.py` 檔尾，`if __name__` 區塊之前）**
 
@@ -351,6 +383,18 @@ class TestDependencyGraph(unittest.TestCase):
     def test_add_dep_unknown_key_raises_key_error(self):
         with self.assertRaises(KeyError):
             todo_store.add_dep(self.con, 'nosuchkey', self.keys['B'], 'blocks')
+
+    def test_add_dep_duplicate_edge_raises_readable_error(self):
+        # G-5：重複邊視為錯誤，不是靜默 no-op——訊息要可讀，不是裸
+        # sqlite3.IntegrityError 的 traceback
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        with self.assertRaises(ValueError) as ctx:
+            todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        self.assertIn('已存在', str(ctx.exception))
+        # 失敗的重複嘗試不該多寫一筆 dep_add 事件
+        events = [e for e in todo_store.list_events(self.con, self.keys['A'])
+                 if e[0] == 'dep_add']
+        self.assertEqual(len(events), 1)
 
     def test_add_dep_cyclic_blocks_rejected_with_readable_message(self):
         todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
@@ -436,11 +480,35 @@ class TestDependencyGraph(unittest.TestCase):
         events = todo_store.list_events(self.con, self.keys['A'])
         self.assertEqual(events[0][2], 'done')
         self.assertEqual(events[1][2], 'doing')
+
+    def test_edit_title_migrates_dep_edges_to_new_key(self):
+        # G-6：改標題必換 key（既有行為），todo_dep 的 from_key/to_key
+        # 兩欄都要跟著搬，否則依賴圖斷鏈、doctor 會把改名誤報成刪除
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        new_key = todo_store.edit_title(self.con, self.keys['A'], '新標題A')
+        self.assertNotEqual(new_key, self.keys['A'])
+        row = self.con.execute(
+            'SELECT from_key FROM todo_dep WHERE to_key=?',
+            (self.keys['B'],)).fetchone()
+        self.assertEqual(row[0], new_key)
+        # 舊 key 不該再留下任何孤兒邊
+        orphan = self.con.execute(
+            'SELECT COUNT(*) FROM todo_dep WHERE from_key=? OR to_key=?',
+            (self.keys['A'], self.keys['A'])).fetchone()[0]
+        self.assertEqual(orphan, 0)
+
+    def test_edit_title_migrates_event_history_to_new_key(self):
+        todo_store.set_status(self.con, self.keys['A'], 'doing', by='sess-a')
+        new_key = todo_store.edit_title(self.con, self.keys['A'], '新標題A')
+        self.assertEqual(todo_store.list_events(self.con, self.keys['A']), [])
+        events_new = todo_store.list_events(self.con, new_key)
+        self.assertEqual(len(events_new), 1)
+        self.assertEqual(events_new[0][2], 'doing')
 ```
 
 - [ ] **Step 2: 確認測試失敗**
 
-Run: `cd /var/repos/todos && python3 -m pytest skills/todo-audit/tests/test_store.py -k TestDependencyGraph -v`
+Run: `cd skills/todo-audit && python3 -m unittest tests.test_store -k TestDependencyGraph -v`
 Expected: FAIL——`todo_dep`/`todo_event` 表不存在、`add_dep` 等屬性不存在
 
 - [ ] **Step 3: 修改 `todo_store.py`**
@@ -552,8 +620,10 @@ def _key_exists(con, key):
 def add_dep(con, from_key, to_key, kind, by=None):
     """新增一條依賴邊。blocks/parent-child 寫入前做環狀依賴檢查，
     偵測到就 raise ValueError 並附上具體的環路徑（用 short_id 呈現，
-    不是「有環」三個字）。重複新增同一條邊是 no-op（INSERT OR IGNORE），
-    不視為錯誤——避免重跑腳本時因為邊已存在而中斷。
+    不是「有環」三個字）。重複新增同一條邊視為錯誤——與 remove_dep/
+    remove_line 等既有函式對「找不到」的處理方式對稱，不靜默吞掉
+    （見 requirements.md Stage 2 裁決 G-5：靜默 no-op 會讓「打錯 kind
+    後補一次正確呼叫」跟「單純重跑」混為一談）。
     """
     todo_deps.validate_kind(kind)
     for k in (from_key, to_key):
@@ -569,11 +639,14 @@ def add_dep(con, from_key, to_key, kind, by=None):
                 con.execute('SELECT short_id FROM todo WHERE key=?',
                             (k,)).fetchone()[0] for k in cycle)
             raise ValueError(f'會造成環狀依賴：{names}')
-    con.execute(
-        'INSERT OR IGNORE INTO todo_dep(from_key,to_key,kind,created_at,created_by)'
-        ' VALUES(?,?,?,?,?)',
-        (from_key, to_key, kind,
-         datetime.now().isoformat(timespec='seconds'), by))
+    try:
+        con.execute(
+            'INSERT INTO todo_dep(from_key,to_key,kind,created_at,created_by)'
+            ' VALUES(?,?,?,?,?)',
+            (from_key, to_key, kind,
+             datetime.now().isoformat(timespec='seconds'), by))
+    except sqlite3.IntegrityError:
+        raise ValueError(f'{from_key} -{kind}-> {to_key} 已存在')
     _record_event(con, from_key, 'dep_add', None, f'{kind}:{to_key}', by)
     con.commit()
 
@@ -641,9 +714,44 @@ def newly_unblocked_after(con, key):
                         (k,)).fetchone()[0] for k in downstream]
 ```
 
+**G-6 修正：`edit_title()` 補上 `todo_dep`/`todo_event` 的 key 遷移。** 找到既有的
+`_KEYED_TABLES = ('todo_line', 'anchor', 'probe', 'verdict')` 這一行，改成：
+
+```python
+_KEYED_TABLES = ('todo_line', 'anchor', 'probe', 'verdict', 'todo_event')
+```
+
+（`todo_event` 的欄名是 `todo_key`，與其餘四表相同，可直接併入既有迴圈；
+`todo_dep` 有 `from_key`/`to_key` 兩個獨立欄位，不符合這個共用假設，
+需要在 `edit_title()` 內單獨處理。）
+
+找到 `edit_title()` 內既有的這段：
+
+```python
+    if new_key != key:
+        if con.execute('SELECT 1 FROM todo WHERE key=?', (new_key,)).fetchone():
+            raise ValueError(f'已有同日同標題的條目（key={new_key}）')
+        for tbl in _KEYED_TABLES:
+            con.execute(f'UPDATE {tbl} SET todo_key=? WHERE todo_key=?',
+                        (new_key, key))
+```
+
+在 `for tbl in _KEYED_TABLES:` 迴圈之後（仍在 `if new_key != key:` 區塊內）加入：
+
+```python
+        # todo_dep 有 from_key/to_key 兩欄，不符合 _KEYED_TABLES 統一用
+        # todo_key 欄名的假設，獨立處理。不遷移的話依賴圖會斷鏈，且
+        # doctor 的懸空邊 WARN 會把「條目被改名」誤報成「條目被刪除」
+        # （見 requirements.md Stage 2 裁決 G-6）。
+        con.execute('UPDATE todo_dep SET from_key=? WHERE from_key=?',
+                    (new_key, key))
+        con.execute('UPDATE todo_dep SET to_key=? WHERE to_key=?',
+                    (new_key, key))
+```
+
 - [ ] **Step 4: 確認測試通過**
 
-Run: `cd /var/repos/todos && python3 -m pytest skills/todo-audit/tests/test_store.py -v`
+Run: `cd skills/todo-audit && python3 -m unittest tests.test_store -v`
 Expected: PASS，全部（含既有）測試綠燈
 
 - [ ] **Step 5: Commit**
@@ -654,10 +762,11 @@ git commit -m "$(cat <<'EOF'
 feat(todo-audit): todo_store 新增依賴圖與變更軌跡
 
 新表 todo_dep（blocks/related/parent-child/discovered-from）與
-todo_event（append-only）。add_dep()/remove_dep() 做環狀依賴檢查，
-拒絕時附具體環路徑；set_status() 每次成功轉態多寫一筆事件；
-ready_keys()/newly_unblocked_after() 供 CLI 的 --ready 與 mark done
-提示使用。
+todo_event（append-only）。add_dep()/remove_dep() 做環狀依賴檢查與
+重複邊檢查，拒絕時附可讀訊息；set_status() 每次成功轉態多寫一筆
+事件；ready_keys()/newly_unblocked_after() 供 CLI 的 --ready 與
+mark done 提示使用。順帶修正 edit_title() 換 key 時遺漏遷移新表的
+問題，避免改標題後依賴圖斷鏈、doctor 誤報懸空邊。
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_019pftVSDE1jfZ3btrRtTdZp
@@ -668,6 +777,8 @@ EOF
 ---
 
 ### Task 3: `todo_cli.py` —— `dep` 子指令與 `list --ready`
+
+**Covers:** REQ-1（`dep add`/`dep rm` CLI 介面）, REQ-2（CLI 層環狀依賴拒絕）, REQ-3（`list --ready` CLI 介面）
 
 **Files:**
 - Modify: `skills/todo-audit/scripts/todo_cli.py`
@@ -735,7 +846,7 @@ class TestDepCommand(unittest.TestCase):
 
 - [ ] **Step 2: 確認測試失敗**
 
-Run: `cd /var/repos/todos && python3 -m pytest skills/todo-audit/tests/test_cli.py -k TestDepCommand -v`
+Run: `cd skills/todo-audit && python3 -m unittest tests.test_cli -k TestDepCommand -v`
 Expected: FAIL——`dep` 子指令不存在（argparse 報 invalid choice）、`list` 無 `--ready`
 
 - [ ] **Step 3: 修改 `todo_cli.py`**
@@ -818,7 +929,7 @@ def cmd_list(con, args):
 
 - [ ] **Step 4: 確認測試通過**
 
-Run: `cd /var/repos/todos && python3 -m pytest skills/todo-audit/tests/test_cli.py -v`
+Run: `cd skills/todo-audit && python3 -m unittest tests.test_cli -v`
 Expected: PASS，全部（含既有）測試綠燈
 
 - [ ] **Step 5: Commit**
@@ -840,6 +951,8 @@ EOF
 ---
 
 ### Task 4: `mark` 解阻塞提示與 `show` 變更軌跡
+
+**Covers:** REQ-4（`mark done`/`unpick` 解阻塞提示）, REQ-6（`show` 顯示變更軌跡）
 
 **Files:**
 - Modify: `skills/todo-audit/scripts/todo_cli.py`（`cmd_mark`、`cmd_show`）
@@ -893,7 +1006,7 @@ class TestMarkDoneUnblocksDownstream(unittest.TestCase):
 
 - [ ] **Step 2: 確認測試失敗**
 
-Run: `cd /var/repos/todos && python3 -m pytest skills/todo-audit/tests/test_cli.py -k TestMarkDoneUnblocksDownstream -v`
+Run: `cd skills/todo-audit && python3 -m unittest tests.test_cli -k TestMarkDoneUnblocksDownstream -v`
 Expected: FAIL——`mark done` 不印解阻塞提示、`show` 沒有「變更軌跡」段落
 
 - [ ] **Step 3: 修改 `todo_cli.py`**
@@ -952,7 +1065,7 @@ def cmd_show(con, args):
 
 - [ ] **Step 4: 確認測試通過**
 
-Run: `cd /var/repos/todos && python3 -m pytest skills/todo-audit/tests/test_cli.py -v`
+Run: `cd skills/todo-audit && python3 -m unittest tests.test_cli -v`
 Expected: PASS，全部（含既有）測試綠燈
 
 - [ ] **Step 5: Commit**
@@ -975,6 +1088,8 @@ EOF
 ---
 
 ### Task 5: `doctor` —— 懸空依賴與環狀依賴檢查
+
+**Covers:** REQ-8（doctor 依賴完整性檢查，只 WARN 不修復）
 
 **Files:**
 - Modify: `skills/todo-audit/scripts/todo_cli.py`（`cmd_doctor`）
@@ -1047,7 +1162,7 @@ class TestDoctorDependencyIntegrity(unittest.TestCase):
 
 - [ ] **Step 2: 確認測試失敗**
 
-Run: `cd /var/repos/todos && python3 -m pytest skills/todo-audit/tests/test_doctor.py -k TestDoctorDependencyIntegrity -v`
+Run: `cd skills/todo-audit && python3 -m unittest tests.test_doctor -k TestDoctorDependencyIntegrity -v`
 Expected: FAIL——doctor 尚未印出任何依賴相關 WARN
 
 - [ ] **Step 3: 修改 `todo_cli.py` 的 `cmd_doctor`**
@@ -1083,7 +1198,7 @@ Expected: FAIL——doctor 尚未印出任何依賴相關 WARN
 
 - [ ] **Step 4: 確認測試通過**
 
-Run: `cd /var/repos/todos && python3 -m pytest skills/todo-audit/tests/test_doctor.py -v`
+Run: `cd skills/todo-audit && python3 -m unittest tests.test_doctor -v`
 Expected: PASS，全部（含既有）測試綠燈
 
 - [ ] **Step 5: Commit**
@@ -1106,6 +1221,8 @@ EOF
 ---
 
 ### Task 6: 文件更新
+
+**Covers:** REQ-11（操作手冊補文件）
 
 **Files:**
 - Modify: `docs/TODO-SYSTEM.md`
@@ -1150,7 +1267,7 @@ append-only，不會被覆寫）。`doctor` 會檢查依賴圖的懸空邊與環
 
 - [ ] **Step 2: 確認文件無語法問題（人工檢視即可，無自動化測試）**
 
-Run: `cd /var/repos/todos && git diff docs/TODO-SYSTEM.md`
+Run: `git diff docs/TODO-SYSTEM.md`
 Expected: diff 內容與上方一致，Markdown 格式正確
 
 - [ ] **Step 3: Commit**
