@@ -34,6 +34,23 @@
 
 沒有 TTL 也沒有心跳 —— 判斷對方 session 死活是人的責任，工具只保證資訊齊全、且沒人會在無意識下覆蓋別人。
 
+## 與 Claude Code 原生 Tasks 的分工
+
+Claude Code 自 2026-01（v2.1+，隨 Opus 4.5）起有原生 Tasks 系統（`~/.claude/tasks/`，可用
+`CLAUDE_CODE_TASK_LIST_ID` 跨 session 綁定同一份任務清單，具備依賴阻塞與認領機制）。但截至
+目前它在 Opus 4.8／Sonnet 5／Fable 5／Mythos 5 等較新模型上**預設不開放**，需手動設定
+`CLAUDE_CODE_ENABLE_TODO_TOOLS=1` 或 `--allowedTools` 才能用；且它答的是「要不要做、被誰
+卡住」，沒有「這條資料還新不新鮮」這層概念。
+
+兩者分工：**Tasks 管執行進度與依賴阻塞，todos 管資料是否過期。** 兩邊各自獨立運作、資料層
+不互通——這是刻意選擇，不是還沒做：todos 的待辦內容含各專案的檔案路徑、架構細節與未修漏洞，
+不該流出到另一個儲存層（見上方「資料不在這個 repo」）。若 Tasks 在你的環境可用，兩者可以並行
+使用，不衝突。
+
+todos 本身也在補「任務間依賴關係」與「完整變更軌跡」這塊功能落差（研究過 Tasks 與其設計靈感
+來源 Beads 後的升級方向，見 `docs/specs/2026-08-22-todo-dependency-graph-design.md`），但這是
+todos 獨立長出的能力，不是跟 Tasks 做資料橋接。
+
 ## 資料不在這個 repo
 
 **本 repo 只版控「工具」，不版控「待辦內容」。**
