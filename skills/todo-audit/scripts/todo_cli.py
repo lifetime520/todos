@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import todo_flags
 import todo_store
 
 
@@ -44,7 +45,8 @@ def header(con):
 
 
 def rows(con, include_all=False, section=None, only_doing=False, by=None):
-    q = ('SELECT short_id, key, raw_title, status, status_by, status_at'
+    q = ('SELECT short_id, key, raw_title, status, status_by, status_at,'
+         ' progress, spec_path, memory_ref'
          ' FROM todo WHERE sort_order IS NOT NULL')
     p = []
     if not include_all:
@@ -76,27 +78,56 @@ def body_of(con, key):
         'SELECT text FROM todo_line WHERE todo_key=? ORDER BY seq', (key,))]
 
 
+_FLAG_LABELS = {'implemented': 'implemented', 'reviewed': 'reviewed',
+               'committed': 'committed', 'compiled': 'compiled',
+               'tested': 'tested', 'live_tested': 'live_tested',
+               'deployed': 'deployed'}
+
+
+def progress_bar(progress):
+    p = progress or 0
+    return ' '.join(
+        f"{'✅' if todo_flags.has(p, name) else '⬜'}{_FLAG_LABELS[name]}"
+        for name in todo_flags.ORDER)
+
+
+def item_progress_lines(progress, spec_path, memory_ref, indent='  '):
+    """進度視覺化＋非空 spec/memory 參照的顯示行，供 list/show/dump 三處共用
+    ——避免三個指令各自重複同一段列印邏輯。"""
+    lines = [f'{indent}進度：{progress_bar(progress)}']
+    if spec_path:
+        lines.append(f'{indent}spec: {spec_path}')
+    if memory_ref:
+        lines.append(f'{indent}memory: {memory_ref}')
+    return lines
+
+
 def cmd_list(con, args):
     print(header(con))
-    for sid, key, raw, status, sby, sat in rows(con, section=args.section,
-                                                only_doing=args.doing,
-                                                by=args.by):
+    for (sid, key, raw, status, sby, sat, progress, spec_path,
+        memory_ref) in rows(con, section=args.section, only_doing=args.doing,
+                            by=args.by):
         st = todo_store.state_of(con, key)
         print(f'  {sid}  [{st}]{claim_tag(status, sby, sat)} {raw[6:]}')
+        for line in item_progress_lines(progress, spec_path, memory_ref,
+                                        indent='      '):
+            print(line)
 
 
 def cmd_show(con, args):
     key = todo_store.resolve_ref(con, args.ref)
     print(header(con))
     r = con.execute('SELECT short_id, raw_title, status, status_note,'
-                    ' status_by, status_at FROM todo WHERE key=?',
-                    (key,)).fetchone()
+                    ' status_by, status_at, progress, spec_path, memory_ref'
+                    ' FROM todo WHERE key=?', (key,)).fetchone()
     owner = (f'  by={r[4] or "(未署名)"} @ {r[5] or "時間不明"}'
              f'（{todo_store.humanize_age(r[5])}）'
              if r[2] and r[2] != 'pending' else '')
     print(f'  {r[0]}  [{todo_store.state_of(con, key)}]  status={r[2]}{owner}'
           + (f'  note={r[3]}' if r[3] else ''))
     print(f'  {r[1]}')
+    for line in item_progress_lines(r[6], r[7], r[8], indent='  '):
+        print(line)
     # 印出 seq —— edit --line / rm --line 要靠它指名，不顯示就沒法用
     for seq, text in con.execute(
             'SELECT seq, text FROM todo_line WHERE todo_key=? ORDER BY seq',
@@ -107,20 +138,26 @@ def cmd_show(con, args):
 def cmd_dump(con, args):
     if args.format == 'json':
         out = []
-        for sid, key, raw, status, sby, sat in rows(con, include_all=args.all,
-                                                    section=args.section):
+        for (sid, key, raw, status, sby, sat, progress, spec_path,
+            memory_ref) in rows(con, include_all=args.all,
+                                section=args.section):
             out.append({'short_id': sid, 'key': key, 'title': raw[6:],
                         'status': status, 'status_by': sby, 'status_at': sat,
                         'state': todo_store.state_of(con, key),
+                        'progress': todo_flags.summary(progress),
+                        'spec_path': spec_path, 'memory_ref': memory_ref,
                         'body': body_of(con, key)})
         print(json.dumps({'freshness': todo_store.freshness(con), 'items': out},
                          ensure_ascii=False, indent=2))
         return
     print(header(con))
-    for sid, key, raw, status, sby, sat in rows(con, include_all=args.all,
-                                                section=args.section):
+    for (sid, key, raw, status, sby, sat, progress, spec_path,
+        memory_ref) in rows(con, include_all=args.all, section=args.section):
         st = todo_store.state_of(con, key)
         print(f'\n{sid} [{st}]{claim_tag(status, sby, sat)} {raw}')
+        for line in item_progress_lines(progress, spec_path, memory_ref,
+                                        indent='    '):
+            print(line)
         for text in body_of(con, key):
             print(text)
 
@@ -147,8 +184,10 @@ def cmd_note(con, args):
 
 def cmd_edit(con, args):
     key = todo_store.resolve_ref(con, args.ref)
-    if args.title is None and args.line is None:
-        print('需指定 --title 或 --line N <text>', file=sys.stderr)
+    if (args.title is None and args.line is None
+            and args.spec is None and args.memory is None):
+        print('需指定 --title、--line N <text>、--spec 或 --memory',
+              file=sys.stderr)
         return 5
     if args.title is not None:
         key = todo_store.edit_title(con, key, args.title)
@@ -157,6 +196,10 @@ def cmd_edit(con, args):
             print('--line 需搭配新內容（位置參數 text）', file=sys.stderr)
             return 5
         todo_store.edit_line(con, key, args.line, args.text)
+    if args.spec is not None:
+        todo_store.set_spec_path(con, key, args.spec)
+    if args.memory is not None:
+        todo_store.set_memory_ref(con, key, args.memory)
     todo_store.write_mirror(con, args.project_resolved,
                             mirror_path(args.project_resolved))
     sid = con.execute('SELECT short_id FROM todo WHERE key=?',
@@ -206,6 +249,16 @@ def cmd_mark(con, args):
     who = ('（已釋放認領）' if args.status == 'pending'
            else f'（by {args.by}）' if args.by else '')
     print(f'{args.ref} → {args.status}{who}')
+
+
+def cmd_flag(con, args):
+    key = todo_store.resolve_ref(con, args.ref)
+    new_progress = todo_store.set_progress(con, key, args.op, args.name)
+    todo_store.write_mirror(con, args.project_resolved,
+                            mirror_path(args.project_resolved))
+    sid = con.execute('SELECT short_id FROM todo WHERE key=?',
+                      (key,)).fetchone()[0]
+    print(f'{sid} 進度 {args.op} {args.name} → {progress_bar(new_progress)}')
 
 
 def cmd_add(con, args):
@@ -431,6 +484,8 @@ def main():
     p.add_argument('text', nargs='?', help='--line 時的新內容（需自帶 marker）')
     p.add_argument('--title', help='新標題（日期前綴自動保留）')
     p.add_argument('--line', type=int, help='要改的 body 行序號（見 show）')
+    p.add_argument('--spec', help='規格文件路徑參照（只存字串，不驗證存在）')
+    p.add_argument('--memory', help='auto memory 系統的相關檔案路徑參照')
     p.set_defaults(fn=cmd_edit)
 
     p = sub.add_parser('rm', parents=[common])
@@ -452,6 +507,12 @@ def main():
     p.add_argument('--force', action='store_true',
                    help='接管他人的 doing —— 先確認對方 session 真的結束了')
     p.set_defaults(fn=cmd_mark)
+
+    p = sub.add_parser('flag', parents=[common])
+    p.add_argument('ref')
+    p.add_argument('op', choices=['set', 'clear', 'toggle'])
+    p.add_argument('name', choices=list(todo_flags.FLAGS.keys()))
+    p.set_defaults(fn=cmd_flag)
 
     p = sub.add_parser('add', parents=[common])
     p.add_argument('title')

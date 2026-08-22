@@ -500,5 +500,78 @@ class TestSimilarWithMixedLineOrigins(unittest.TestCase):
 
 
 
+class TestProgressFlagCommand(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        audit = self.home / '.claude' / 'todos' / '.audit'
+        audit.mkdir(parents=True)
+        con = todo_store.connect(audit / 'demo.sqlite')
+        todo_store.save_parsed(con, 'demo', todo_store.parse_md_lossless(SAMPLE))
+        todo_store.assign_short_ids(con)
+        con.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_flag_set_then_show_reflects_progress(self):
+        r = run_cli('flag', 'T-001', 'set', 'implemented',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run_cli('show', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertIn('✅implemented', r.stdout)
+        self.assertIn('進度', r.stdout)
+
+    def test_flag_unknown_name_rejected(self):
+        r = run_cli('flag', 'T-001', 'set', 'not_a_flag',
+                    '--project', 'demo', env_home=self.home)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_flag_clear_and_toggle(self):
+        run_cli('flag', 'T-001', 'set', 'reviewed',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('flag', 'T-001', 'clear', 'reviewed',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run_cli('flag', 'T-001', 'toggle', 'committed',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_completing_all_flags_shows_done_status_in_list(self):
+        for name in ('implemented', 'reviewed', 'committed', 'compiled',
+                    'tested', 'live_tested', 'deployed'):
+            run_cli('flag', 'T-001', 'set', name,
+                    '--project', 'demo', env_home=self.home)
+        r = run_cli('show', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertIn('status=done', r.stdout)
+
+    def test_edit_spec_and_memory_ref_show_in_show_output(self):
+        r = run_cli('edit', 'T-001', '--spec', 'docs/specs/x.md',
+                    '--memory', 'memory/y.md',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run_cli('show', 'T-001', '--project', 'demo', env_home=self.home)
+        self.assertIn('docs/specs/x.md', r.stdout)
+        self.assertIn('memory/y.md', r.stdout)
+
+    def test_list_omits_spec_memory_lines_when_unset(self):
+        r = run_cli('list', '--project', 'demo', env_home=self.home)
+        self.assertNotIn('spec:', r.stdout)
+        self.assertNotIn('memory:', r.stdout)
+
+    def test_dump_json_includes_progress_and_refs(self):
+        run_cli('flag', 'T-001', 'set', 'implemented',
+                '--project', 'demo', env_home=self.home)
+        run_cli('edit', 'T-001', '--spec', 'docs/specs/x.md',
+                '--project', 'demo', env_home=self.home)
+        r = run_cli('dump', '--format', 'json', '--all',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        item = next(i for i in data['items'] if i['short_id'] == 'T-001')
+        self.assertEqual(item['progress'], ['implemented'])
+        self.assertEqual(item['spec_path'], 'docs/specs/x.md')
+
+
 if __name__ == '__main__':
     unittest.main()
