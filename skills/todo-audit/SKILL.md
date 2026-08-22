@@ -40,6 +40,8 @@ python3 $T edit <T-NNN> --title "新標題"         # key 與稽核歷史自動�
 python3 $T edit <T-NNN> "🏷️  新內容" --line 1
 python3 $T rm   <T-NNN> [--line N | --force]
 python3 $T mark <T-NNN> {pending|doing|done|unpick} [--note "..."] [--by 誰] [--force]
+python3 $T flag <T-NNN> {set|clear|toggle} <name>    # name ∈ implemented/reviewed/committed/compiled/tested/live_tested/deployed
+python3 $T edit <T-NNN> --spec "docs/specs/xxx.md" --memory ".claude/memory/xxx.md"
 
 python3 $T audit          # 轉呼下面的 todo_audit.py
 ```
@@ -52,6 +54,8 @@ python3 $T audit          # 轉呼下面的 todo_audit.py
 **條目一旦是他人的 `doing`，任何 status 變更都被擋下**（exit 7），不只是重複認領。
 守衛範圍刻意放寬到 `done` / `unpick` / `pending`：B 把 A 正在做的條目標成 done
 比重複認領更糟 —— A 還在寫程式，條目已從清單消失，而 A 不會收到任何通知。
+唯一例外：`flag` 補滿七個交付進度旗標時會自動把 status 轉為 done，這不經過這道守衛
+（是工作自然做完，不是搶認領），`status_by` 會保留原認領者。
 
 ```bash
 python3 $T mark T-003 doing --by session-alpha    # 認領

@@ -164,6 +164,7 @@ python3 $T flag <T-NNN> toggle <name>
 # 七個旗標全數點滿時，status 會自動轉為 done（unpick 條目不受影響）
 
 # 規格文件 / session memory 參照（只存路徑字串，不驗證存在；doctor 會檢查）
+# spec_path 與 memory_ref 皆相對 repo root 解析，絕對路徑原樣使用
 python3 $T edit <T-NNN> --spec "docs/specs/2026-08-22-xxx-design.md"
 python3 $T edit <T-NNN> --memory "memory/xxx.md"
 

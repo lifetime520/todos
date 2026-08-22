@@ -476,10 +476,14 @@ def append_item(con, project, title, tags, note):
     key = todo_key(date, full_title)
     raw_title = f'- [ ] {full_title}'
     mx = con.execute('SELECT MAX(sort_order) FROM todo').fetchone()[0] or 0
+    # progress=0 明寫在 INSERT 裡（同 save_parsed 的理由）：backfill 只在
+    # connect() 當下跑一次，這裡新插入的列在同一個連線的後續呼叫裡不會
+    # 再經過 connect() —— 留 NULL 而條目在同連線內被標成 done，下次
+    # connect() 的 backfill 會誤判成「上線前的舊 done」而灌成 127。
     con.execute('INSERT OR REPLACE INTO todo(key,date,title,raw_title,section,'
-                'sort_order,status) VALUES(?,?,?,?,?,?,?)',
+                'sort_order,status,progress) VALUES(?,?,?,?,?,?,?,?)',
                 (key, date, full_title, raw_title, _section_of(full_title),
-                 mx + 1, 'pending'))
+                 mx + 1, 'pending', 0))
     con.execute('DELETE FROM todo_line WHERE todo_key=?', (key,))
     # tags / note 由呼叫端自帶 marker —— todo-add.sh 的介面是
     # `todo-add.sh "標題" "🏷️  a, b" "💡  說明"`（寫死在 ~/.claude/CLAUDE.md），

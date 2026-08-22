@@ -253,12 +253,22 @@ def cmd_mark(con, args):
 
 def cmd_flag(con, args):
     key = todo_store.resolve_ref(con, args.ref)
+    before_status, before_by = con.execute(
+        'SELECT status, status_by FROM todo WHERE key=?', (key,)).fetchone()
     new_progress = todo_store.set_progress(con, key, args.op, args.name)
+    after_status = con.execute(
+        'SELECT status FROM todo WHERE key=?', (key,)).fetchone()[0]
     todo_store.write_mirror(con, args.project_resolved,
                             mirror_path(args.project_resolved))
     sid = con.execute('SELECT short_id FROM todo WHERE key=?',
                       (key,)).fetchone()[0]
     print(f'{sid} 進度 {args.op} {args.name} → {progress_bar(new_progress)}')
+    # set_progress() 在七旗標補滿時會靜默把 status 轉成 done（不經過
+    # set_status() 的認領守衛）——CLI 這裡補一行公告，避免條目在下一次
+    # list 時無聲從清單消失，讓認領者摸不著頭緒（見 SKILL.md 的教訓）。
+    if before_status != 'done' and after_status == 'done':
+        who = f'（原認領者 {before_by} 保留）' if before_by else ''
+        print(f'  → 七旗標全滿，status 自動轉為 done{who}')
 
 
 def cmd_add(con, args):
@@ -312,7 +322,7 @@ def cmd_audit(con, args):
 
 
 def _resolve_ref_path(base, value):
-    """spec_path 相對 repo root、memory_ref 相對 HOME 解析；
+    """spec_path／memory_ref 皆相對 repo root 解析（spec §7）；
     絕對路徑原樣使用。"""
     p = Path(value)
     return p if p.is_absolute() else base / value
@@ -371,7 +381,7 @@ def cmd_doctor(con, args):
                 " AND (spec_path IS NOT NULL OR memory_ref IS NOT NULL)"):
             if spec_path and not _resolve_ref_path(repo, spec_path).exists():
                 print(f'WARN {sid} 的 spec_path 指向不存在的檔案：{spec_path}')
-            if memory_ref and not _resolve_ref_path(home, memory_ref).exists():
+            if memory_ref and not _resolve_ref_path(repo, memory_ref).exists():
                 print(f'WARN {sid} 的 memory_ref 指向不存在的檔案：{memory_ref}')
 
     defaults = {'search_dirs': list(todo_audit.SEARCH_DIRS),

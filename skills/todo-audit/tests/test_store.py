@@ -284,6 +284,24 @@ class TestAppendItem(unittest.TestCase):
         self.assertTrue(raw.startswith('- [ ] ['))
         self.assertTrue(raw.endswith('標題'))
 
+    def test_appended_item_then_done_survives_reconnect_without_backfill(self):
+        # I-2 回歸測試：append_item 若漏寫 progress=0，新條目的 progress
+        # 留 NULL；同連線內若之後被標成 done，下一次 connect() 的 backfill
+        # （UPDATE ... WHERE status='done' AND progress IS NULL）會誤判成
+        #「上線前的舊 done」而灌成 127（ALL_FLAGS）——謊稱 reviewed/
+        # compiled/tested/live_tested/deployed 全部發生過。
+        db_path = Path(self.tmp.name) / 't.sqlite'
+        todo_store.append_item(self.con, 'p', '標題', '', '')
+        key = self.con.execute('SELECT key FROM todo').fetchone()[0]
+        todo_store.set_status(self.con, key, 'done', by='tester')
+        self.con.close()
+
+        con2 = todo_store.connect(db_path)
+        progress = con2.execute('SELECT progress FROM todo WHERE key=?',
+                                (key,)).fetchone()[0]
+        con2.close()
+        self.assertEqual(progress, 0)
+
 
 class TestEditAndRemove(unittest.TestCase):
     def setUp(self):

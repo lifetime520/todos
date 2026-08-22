@@ -545,6 +545,21 @@ class TestProgressFlagCommand(unittest.TestCase):
         r = run_cli('show', 'T-001', '--project', 'demo', env_home=self.home)
         self.assertIn('status=done', r.stdout)
 
+    def test_completing_all_flags_announces_auto_done_in_flag_stdout(self):
+        # I-4：set_progress() 補滿七旗標時會靜默把 status 轉成 done——
+        # cmd_flag 必須在觸發那次呼叫的 stdout 上公告，而不是要人再跑一次
+        # show 才看得到，否則條目會無聲從 list 消失。
+        names = ('implemented', 'reviewed', 'committed', 'compiled',
+                'tested', 'live_tested', 'deployed')
+        for name in names[:-1]:
+            r = run_cli('flag', 'T-001', 'set', name,
+                        '--project', 'demo', env_home=self.home)
+            self.assertNotIn('自動轉為 done', r.stdout)
+        r = run_cli('flag', 'T-001', 'set', names[-1],
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('自動轉為 done', r.stdout)
+
     def test_edit_spec_and_memory_ref_show_in_show_output(self):
         r = run_cli('edit', 'T-001', '--spec', 'docs/specs/x.md',
                     '--memory', 'memory/y.md',
