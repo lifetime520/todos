@@ -52,3 +52,6 @@ venv/
 
 # ── macOS ──
 .DS_Store
+
+# ── Claude Code superpowers 開發過程產物（ledger、審查包，非交付物）──
+.superpowers/
