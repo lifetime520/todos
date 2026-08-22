@@ -10,6 +10,8 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+import todo_flags
+
 # 既有六表由 todo_audit.py 的 SCHEMA 建立；此處只做增量 migration。
 # 每一項都必須是 idempotent —— connect() 每次呼叫都會全跑一遍。
 MIGRATIONS = [
@@ -31,6 +33,11 @@ MIGRATIONS = [
     # 刻意不進 probe.state（見 state_of()）—— 那會讓 freshness() 的
     # `WHERE state IN ('TOUCHED','PARTIAL_GONE')` 統計靜默失真。
     "ALTER TABLE run ADD COLUMN degraded INT",
+    # 交付進度位元旗標與外部參照（見
+    # docs/specs/2026-08-22-todo-progress-bitmask-design.md）。
+    "ALTER TABLE todo ADD COLUMN progress INT",
+    "ALTER TABLE todo ADD COLUMN spec_path TEXT",
+    "ALTER TABLE todo ADD COLUMN memory_ref TEXT",
 ]
 
 # 完整 schema。前六張表與 todo_audit.py 的 SCHEMA 定義相同（IF NOT EXISTS，
@@ -84,6 +91,12 @@ def connect(db_path):
                 raise
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_todo_short_id"
                 " ON todo(short_id) WHERE short_id IS NOT NULL")
+    # progress 的一次性 backfill：既有 done 條目視為已跑完整個 pipeline，
+    # 其餘一律未知＝0。之後每次呼叫都是 no-op —— 補滿後 `progress IS NULL`
+    # 不會再命中任何列，migration 保持 idempotent。
+    con.execute("UPDATE todo SET progress=? WHERE status='done'"
+                " AND progress IS NULL", (todo_flags.ALL_FLAGS,))
+    con.execute("UPDATE todo SET progress=0 WHERE progress IS NULL")
     con.commit()
     return con
 
@@ -259,13 +272,17 @@ def save_parsed(con, project, parsed):
                            (it['key'],)).fetchone()
         chash = hashlib.sha1('\n'.join(it['body_raw']).encode()).hexdigest()[:16]
         if prev is None:
+            # progress=0 明寫在 INSERT 裡（不是留給 connect() 的 backfill
+            # 補）：backfill 只在 connect() 當下跑一次，這裡新插入的列在
+            # 同一個連線的後續呼叫裡不會再經過 connect()，留 NULL 會讓剛建
+            # 好的條目在下一次重連前都讀不到 0。
             cur.execute(
                 'INSERT INTO todo(key,date,title,content_hash,raw_title,section,'
-                'group_marker,sort_order,status,heading,md_line)'
-                ' VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                'group_marker,sort_order,status,heading,md_line,progress)'
+                ' VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                 (it['key'], it['date'], it['title'], chash, it['raw_title'],
                  it['section'], it['group_marker'], it['sort_order'], 'pending',
-                 it.get('heading'), it.get('line')))
+                 it.get('heading'), it.get('line'), 0))
         else:
             # status 刻意不在 UPDATE 清單內：遷移重跑不得洗掉已標的 doing/done/unpick
             cur.execute(
@@ -647,4 +664,44 @@ def remove_item(con, key):
     for tbl in _KEYED_TABLES:
         con.execute(f'DELETE FROM {tbl} WHERE todo_key=?', (key,))
     con.execute('DELETE FROM todo WHERE key=?', (key,))
+    con.commit()
+
+
+def set_progress(con, key, op, name):
+    """交付進度位元運算。op ∈ {'set','clear','toggle'}，name 見 todo_flags.FLAGS。
+
+    七個旗標全數點滿、且目前不是 unpick/done 時，單向自動轉 status='done'——
+    刻意不經過 set_status() 的 ClaimConflict 擁有者比對、也不改動
+    status_by：這是工作自然做完的結果，不是新的認領動作。若目前已是
+    done，觸發是 no-op，避免洗掉原本的完成時間。
+    """
+    row = con.execute('SELECT progress, status FROM todo WHERE key=?',
+                      (key,)).fetchone()
+    if row is None:
+        raise KeyError(key)
+    cur_progress, status = row
+    cur_progress = cur_progress or 0
+    ops = {'set': todo_flags.set_, 'clear': todo_flags.clear,
+          'toggle': todo_flags.toggle}
+    if op not in ops:
+        raise ValueError(f'unknown progress op: {op}')
+    new_progress = ops[op](cur_progress, name)
+    con.execute('UPDATE todo SET progress=? WHERE key=?', (new_progress, key))
+    if todo_flags.is_complete(new_progress) and status not in ('unpick', 'done'):
+        con.execute('UPDATE todo SET status=?, status_at=? WHERE key=?',
+                    ('done', datetime.now().isoformat(timespec='seconds'), key))
+    con.commit()
+    return new_progress
+
+
+def set_spec_path(con, key, path):
+    """設定規格文件參照。只存路徑字串，不驗證存在——寫入當下文件可能還沒
+    建好；存在性檢查交給 doctor。"""
+    con.execute('UPDATE todo SET spec_path=? WHERE key=?', (path, key))
+    con.commit()
+
+
+def set_memory_ref(con, key, path):
+    """設定 auto memory 系統的相關檔案參照，語意同 set_spec_path。"""
+    con.execute('UPDATE todo SET memory_ref=? WHERE key=?', (path, key))
     con.commit()

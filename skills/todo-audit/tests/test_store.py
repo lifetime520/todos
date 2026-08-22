@@ -492,5 +492,135 @@ class TestMigrateTargets(unittest.TestCase):
             self.assertEqual(migrate_md_to_db.discover_targets(p), ['proj'])
 
 
+class TestProgressFlags(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dbpath = Path(self.tmp.name) / 't.sqlite'
+        self.con = todo_store.connect(self.dbpath)
+        todo_store.save_parsed(self.con, 'demo',
+                               todo_store.parse_md_lossless(SAMPLE))
+        self.key = self.con.execute(
+            'SELECT key FROM todo ORDER BY sort_order').fetchone()[0]
+
+    def tearDown(self):
+        self.con.close()
+        self.tmp.cleanup()
+
+    def test_migration_adds_progress_columns(self):
+        cols = {r[1] for r in self.con.execute('PRAGMA table_info(todo)')}
+        for c in ('progress', 'spec_path', 'memory_ref'):
+            self.assertIn(c, cols, f'missing column {c}')
+
+    def test_fresh_rows_default_progress_to_zero(self):
+        p = self.con.execute('SELECT progress FROM todo WHERE key=?',
+                             (self.key,)).fetchone()[0]
+        self.assertEqual(p, 0)
+
+    def test_existing_done_rows_backfilled_to_full_progress_on_reconnect(self):
+        self.con.execute("UPDATE todo SET status='done', progress=NULL"
+                         " WHERE key=?", (self.key,))
+        self.con.commit()
+        self.con.close()
+        self.con = todo_store.connect(self.dbpath)
+        p = self.con.execute('SELECT progress FROM todo WHERE key=?',
+                             (self.key,)).fetchone()[0]
+        self.assertEqual(p, 127)
+
+    def test_set_progress_sets_single_bit_and_returns_new_value(self):
+        new_p = todo_store.set_progress(self.con, self.key, 'set', 'implemented')
+        self.assertEqual(new_p, 1)
+        stored = self.con.execute('SELECT progress FROM todo WHERE key=?',
+                                  (self.key,)).fetchone()[0]
+        self.assertEqual(stored, 1)
+
+    def test_set_progress_clear_and_toggle(self):
+        todo_store.set_progress(self.con, self.key, 'set', 'reviewed')
+        todo_store.set_progress(self.con, self.key, 'clear', 'reviewed')
+        p = self.con.execute('SELECT progress FROM todo WHERE key=?',
+                             (self.key,)).fetchone()[0]
+        self.assertEqual(p, 0)
+        todo_store.set_progress(self.con, self.key, 'toggle', 'committed')
+        p = self.con.execute('SELECT progress FROM todo WHERE key=?',
+                             (self.key,)).fetchone()[0]
+        self.assertEqual(p, 4)
+
+    def test_unknown_progress_op_raises(self):
+        with self.assertRaises(ValueError):
+            todo_store.set_progress(self.con, self.key, 'bogus', 'implemented')
+
+    def test_unknown_flag_name_raises(self):
+        with self.assertRaises(ValueError):
+            todo_store.set_progress(self.con, self.key, 'set', 'not_a_flag')
+
+    def test_unknown_key_raises_keyerror(self):
+        with self.assertRaises(KeyError):
+            todo_store.set_progress(self.con, 'nosuchkey', 'set', 'implemented')
+
+    def test_completing_all_flags_auto_transitions_to_done(self):
+        import todo_flags
+        for name in todo_flags.ORDER:
+            todo_store.set_progress(self.con, self.key, 'set', name)
+        status = self.con.execute('SELECT status FROM todo WHERE key=?',
+                                  (self.key,)).fetchone()[0]
+        self.assertEqual(status, 'done')
+
+    def test_unpick_item_does_not_auto_transition(self):
+        import todo_flags
+        todo_store.set_status(self.con, self.key, 'unpick', note='暫不處理')
+        for name in todo_flags.ORDER:
+            todo_store.set_progress(self.con, self.key, 'set', name)
+        status = self.con.execute('SELECT status FROM todo WHERE key=?',
+                                  (self.key,)).fetchone()[0]
+        self.assertEqual(status, 'unpick')
+
+    def test_auto_transition_preserves_status_by_of_current_owner(self):
+        import todo_flags
+        todo_store.set_status(self.con, self.key, 'doing', by='sess-a')
+        for name in todo_flags.ORDER:
+            todo_store.set_progress(self.con, self.key, 'set', name)
+        status, by = self.con.execute(
+            'SELECT status, status_by FROM todo WHERE key=?',
+            (self.key,)).fetchone()
+        self.assertEqual(status, 'done')
+        self.assertEqual(by, 'sess-a',
+                         'progress 補滿觸發的自動完成不該改寫原本的認領者')
+
+    def test_auto_transition_does_not_raise_claim_conflict_for_other_caller(self):
+        # 這是本設計要修的關鍵情境：A 認領中，補滿最後一格的呼叫端不是 A，
+        # 不該被 ClaimConflict 擋下 —— 這是工作自然做完，不是搶認領。
+        import todo_flags
+        todo_store.set_status(self.con, self.key, 'doing', by='sess-a')
+        for name in todo_flags.ORDER:
+            todo_store.set_progress(self.con, self.key, 'set', name)  # 無 by 參數
+        status = self.con.execute('SELECT status FROM todo WHERE key=?',
+                                  (self.key,)).fetchone()[0]
+        self.assertEqual(status, 'done')
+
+    def test_already_done_progress_completion_does_not_overwrite_status_at(self):
+        todo_store.set_status(self.con, self.key, 'done')
+        original_at = self.con.execute(
+            'SELECT status_at FROM todo WHERE key=?', (self.key,)).fetchone()[0]
+        import todo_flags
+        for name in todo_flags.ORDER:
+            todo_store.set_progress(self.con, self.key, 'set', name)
+        after_at = self.con.execute(
+            'SELECT status_at FROM todo WHERE key=?', (self.key,)).fetchone()[0]
+        self.assertEqual(after_at, original_at)
+
+    def test_manual_mark_done_does_not_force_fill_progress(self):
+        todo_store.set_status(self.con, self.key, 'done')
+        p = self.con.execute('SELECT progress FROM todo WHERE key=?',
+                             (self.key,)).fetchone()[0]
+        self.assertEqual(p, 0)
+
+    def test_set_spec_path_and_memory_ref(self):
+        todo_store.set_spec_path(self.con, self.key, 'docs/specs/x.md')
+        todo_store.set_memory_ref(self.con, self.key, 'memory/y.md')
+        row = self.con.execute(
+            'SELECT spec_path, memory_ref FROM todo WHERE key=?',
+            (self.key,)).fetchone()
+        self.assertEqual(row, ('docs/specs/x.md', 'memory/y.md'))
+
+
 if __name__ == '__main__':
     unittest.main()
