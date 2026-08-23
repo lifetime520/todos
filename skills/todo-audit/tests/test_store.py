@@ -944,6 +944,32 @@ class TestDependencyGraph(unittest.TestCase):
         ev = todo_store.list_events(self.con, self.keys['A'])
         self.assertEqual(ev[0][2], f'blocks:{new_key_b}')
 
+    def test_remove_item_deletes_dep_edges_where_it_is_from_key(self):
+        # T-004：remove_item() 清 todo_dep 目前沒有專屬回歸測試，只在
+        # Stage 5 修 C-1（list --ready crash）時手動驗證過——這裡補上。
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        todo_store.remove_item(self.con, self.keys['A'])
+        n = self.con.execute(
+            'SELECT COUNT(*) FROM todo_dep WHERE from_key=? OR to_key=?',
+            (self.keys['A'], self.keys['A'])).fetchone()[0]
+        self.assertEqual(n, 0, 'todo_dep 有殘留 from_key 側的孤兒邊')
+
+    def test_remove_item_deletes_dep_edges_where_it_is_to_key(self):
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        todo_store.remove_item(self.con, self.keys['B'])
+        n = self.con.execute(
+            'SELECT COUNT(*) FROM todo_dep WHERE from_key=? OR to_key=?',
+            (self.keys['B'], self.keys['B'])).fetchone()[0]
+        self.assertEqual(n, 0, 'todo_dep 有殘留 to_key 側的孤兒邊')
+
+    def test_remove_item_then_list_ready_does_not_crash(self):
+        # C-1 的重現路徑本身：dep add -> rm --force -> list --ready
+        # 不能再 TypeError（is_ready 對已刪除 blocker 的 None 防護）。
+        todo_store.add_dep(self.con, self.keys['A'], self.keys['B'], 'blocks')
+        todo_store.remove_item(self.con, self.keys['A'])
+        ready = todo_store.ready_keys(self.con)
+        self.assertIn(self.keys['B'], ready)  # blocker 沒了，B 應變 ready
+
 
 if __name__ == '__main__':
     unittest.main()
