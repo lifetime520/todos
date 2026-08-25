@@ -1046,5 +1046,35 @@ class TestShowChangeHistory(unittest.TestCase):
         self.assertEqual(history.count('pending → doing'), 1)
 
 
+class TestNonDoctorCommandRejectsBindingConflict(unittest.TestCase):
+    """T-002：`test_doctor.py` 只測過 doctor 對 `ProjectBindingConflict` 的
+    豁免行為，其他指令（list/show/dump/...）走 `bind_project()` 判斷式
+    （todo_cli.py:773 附近）從未被鎖住——這裡補一條，確認非 doctor 指令
+    在綁定衝突時仍照常被擋下：exit=6、輸出含衝突訊息。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        audit = self.home / '.claude' / 'todos' / '.audit'
+        audit.mkdir(parents=True)
+        self.db = audit / 'demo.sqlite'
+        con = todo_store.connect(self.db)
+        todo_store.save_parsed(con, 'demo', todo_store.parse_md_lossless(SAMPLE))
+        todo_store.assign_short_ids(con)
+        # 先把 'demo' 綁定到 repo_a，模擬既有專案已綁定到別處
+        todo_store.bind_project(con, 'demo', '/repo_a', '(no-remote)')
+        con.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_list_with_conflicting_path_exits_6_with_message(self):
+        r = run_cli('list', '--project', 'demo', '--path', '/repo_b',
+                    env_home=self.home)
+        self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
+        self.assertIn('不能共用待辦', r.stdout + r.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()
