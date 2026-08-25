@@ -1024,8 +1024,12 @@ def main():
     touch_index = build_symbol_touch_index(repo, earliest, symbols)
     commit_pool = build_commit_pool(repo, earliest)
 
+    dbp = None if '--no-db' in sys.argv else (
+        Path(sys.argv[sys.argv.index('--db') + 1])
+        if '--db' in sys.argv else default_db(repo))
+
     gone_syms = {s for a in all_anchors for s in a['symbol'] if s not in sym_index}
-    never = never_existed(repo, gone_syms, default_db(repo))
+    never = never_existed(repo, gone_syms, dbp)
     if gone_syms:
         print(f'查無符號 {len(gone_syms)} 個，其中 {len(never)} 個從未存在於 git 歷史'
               f'（描述性稱呼，已排除為假 GONE 訊號）\n')
@@ -1048,9 +1052,7 @@ def main():
             'checks': checks,
         })
 
-    if '--no-db' not in sys.argv:
-        dbp = (Path(sys.argv[sys.argv.index('--db') + 1])
-               if '--db' in sys.argv else default_db(repo))
+    if dbp is not None:
         run_id, changed = persist(dbp, todo_path, repo, todos, results,
                                   symbols, hit_rate, _now(), degraded=degraded)
         print(f'sqlite → {dbp}  run#{run_id}  內容有變動 {changed} 條\n')
