@@ -681,6 +681,29 @@ def edit_title(con, key, new_title):
     return new_key
 
 
+_SECTION_HEADING = {'urgent': '🔴', 'decision': '🟠', 'normal': '🟡', 'later': '⚪'}
+
+
+def set_section(con, key, section):
+    """手動搬章節（人的優先序裁示，不是稽核判定）。
+
+    _section_of() 裡 heading 優先於標題關鍵字 —— 過去 CLI 只能靠 --title
+    塞 [P2] 之類標記碰運氣，其實不生效，因為 heading 才是真正的判定依據。
+    這裡直接寫 heading（連帶同步 section 欄位），list --section 才會反映：
+    rows() 是直接對 section 欄位做 WHERE section=?，不會重新用
+    heading 現算 _section_of()。
+    """
+    sym = _SECTION_HEADING.get(section)
+    if sym is None:
+        raise ValueError(
+            f'不支援的 section：{section}（限 {"/".join(_SECTION_HEADING)}）')
+    if con.execute('SELECT 1 FROM todo WHERE key=?', (key,)).fetchone() is None:
+        raise KeyError(key)
+    con.execute('UPDATE todo SET heading=?, section=? WHERE key=?',
+                (sym, section, key))
+    con.commit()
+
+
 def edit_line(con, key, seq, text):
     """改 body 的某一行。text 需自帶 marker。"""
     row = con.execute(

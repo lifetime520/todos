@@ -208,9 +208,9 @@ def cmd_note(con, args):
 
 def cmd_edit(con, args):
     key = todo_store.resolve_ref(con, args.ref)
-    if (args.title is None and args.line is None
-            and args.spec is None and args.memory is None):
-        print('需指定 --title、--line N <text>、--spec 或 --memory',
+    if (args.title is None and args.line is None and args.spec is None
+            and args.memory is None and args.section is None):
+        print('需指定 --title、--line N <text>、--spec、--memory 或 --section',
               file=sys.stderr)
         return 5
     if args.title is not None:
@@ -224,6 +224,8 @@ def cmd_edit(con, args):
         todo_store.set_spec_path(con, key, args.spec)
     if args.memory is not None:
         todo_store.set_memory_ref(con, key, args.memory)
+    if args.section is not None:
+        todo_store.set_section(con, key, args.section)
     todo_store.write_mirror(con, args.project_resolved,
                             mirror_path(args.project_resolved))
     sid = con.execute('SELECT short_id FROM todo WHERE key=?',
@@ -648,6 +650,8 @@ def main():
     p.add_argument('--line', type=int, help='要改的 body 行序號（見 show）')
     p.add_argument('--spec', help='規格文件路徑參照（只存字串，不驗證存在）')
     p.add_argument('--memory', help='auto memory 系統的相關檔案路徑參照')
+    p.add_argument('--section', choices=['urgent', 'decision', 'normal', 'later'],
+                   help='人工搬章節（優先序裁示，非稽核判定）')
     p.set_defaults(fn=cmd_edit)
 
     p = sub.add_parser('rm', parents=[common])
