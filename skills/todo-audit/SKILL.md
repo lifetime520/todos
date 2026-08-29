@@ -42,9 +42,19 @@ python3 $T rm   <T-NNN> [--line N | --force]
 python3 $T mark <T-NNN> {pending|doing|done|unpick} [--note "..."] [--by 誰] [--force]
 python3 $T flag <T-NNN> {set|clear|toggle} <name>    # name ∈ implemented/reviewed/committed/compiled/tested/live_tested/deployed
 python3 $T edit <T-NNN> --spec "docs/specs/xxx.md" --memory ".claude/memory/xxx.md"
+python3 $T edit <T-NNN> --section urgent            # 人工搬章節；合法值 urgent/decision/normal/later
 
 python3 $T audit          # 轉呼下面的 todo_audit.py
 ```
+
+### `edit --section`：為什麼需要這個指令
+
+`list --section` 讀的是 DB 裡 `section` 欄位（`WHERE section=?`），而這個欄位是由 md 的
+章節標頭（heading，如 `## 🔴 緊急`）決定，**不是**由標題裡塞的 `[P0]`/`[P2]` 之類關鍵字決定
+——判定邏輯裡 heading 優先於標題關鍵字。過去只能靠 `--title` 塞這類標記，其實從未生效，
+因為條目仍留在原本的 heading 底下。`edit --section` 直接改寫 heading（同步更新 `section`
+欄位），是**唯一**能把一條待辦搬去別的優先序章節的方式；它是人工裁示優先序，不是稽核判定，
+`todo-audit` 不會因為這個欄位自動改變任何條目的狀態。
 
 ### 認領守衛（多 session 防撞車）
 

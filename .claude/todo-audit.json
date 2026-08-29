@@ -1,0 +1,13 @@
+{
+  "_comment": "per-repo todo-audit 設定：本 repo 是純 Python/Bash 工具倉庫，不是 BTSE Gradle 專案，內建的 SEARCH_DIRS（agent/src/main 等）在這裡零命中，會讓 collect_source_files() 降級為全 repo 掃描並印出 WEAK_AUDIT 警告。search_dirs 只列生產碼與文件目錄，刻意排除 skills/todo-audit/tests —— todo_audit.py 的既有註解說明：測試碼裡殘留的符號引用會讓已刪除的產品碼被誤判成『還活著』，死碼偵測會因此失能。",
+  "search_dirs": [
+    "skills/todo-audit/scripts",
+    "hooks",
+    "docs"
+  ],
+  "scan_exts": [
+    ".py",
+    ".sh",
+    ".md"
+  ]
+}

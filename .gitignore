@@ -32,6 +32,21 @@ skill-snapshot-*/
 # 它自帶 .gitignore，這裡再擋一次做雙保險（自帶的那份若被誤刪就沒防線了）。
 .remember/
 .claude/
+# 白名單例外：.claude/todo-audit.json 必須進版控。
+# 為什麼這個檔可以進 PUBLIC repo：內容只有 search_dirs 目錄名、scan_exts
+# 副檔名與技術性註解，全都是 repo 內本來就公開可見的資訊，沒有新增任何
+# 外洩面（不含路徑外的機密、不含 token/credential）。
+# 白名單只涵蓋這一個確切檔名，`.claude/` 目錄下其餘任何檔案（session 產物、
+# 私密設定）仍全數被上面那條規則擋住。
+# 為什麼必須版控：不進版控的話，任何 clone 與 CI 都拿不到這份設定，
+# `collect_source_files()` 會落到內建 SEARCH_DIRS 零命中，稽核降級成
+# WEAK_AUDIT（見 REQ-5/REQ-6）。
+# 語法注意：`.claude/` 帶尾斜線會讓 git 整個跳過目錄不遞迴，單靠
+# `!.claude/todo-audit.json` 救不回來，必須先重新放行目錄本身、
+# 再擋掉目錄內其餘內容，最後才放行這一個檔名。
+!.claude/
+.claude/*
+!.claude/todo-audit.json
 
 # ── 備份檔 ──
 # 原 ~/.claude/ 裡有 todo-add.sh.bak-20260808-164534 這類檔案。

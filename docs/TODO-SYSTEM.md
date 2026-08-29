@@ -193,6 +193,12 @@ python3 $T flag <T-NNN> toggle <name>
 python3 $T edit <T-NNN> --spec "docs/specs/2026-08-22-xxx-design.md"
 python3 $T edit <T-NNN> --memory "memory/xxx.md"
 
+# 人工搬章節（優先序裁示，非稽核判定）。合法值 urgent/decision/normal/later，
+# 對應 heading 符號 🔴/🟠/🟡/⚪。list --section 讀的是 DB 的 section 欄位，
+# 而該欄位由 md 章節標頭決定、heading 優先於標題裡的 [P0]/[P2] 之類關鍵字 ——
+# 過去只能靠 --title 塞這種標記其實從未生效，這條指令才是真正能搬動優先序的方式。
+python3 $T edit <T-NNN> --section urgent
+
 # 依賴關係（blocks / related / parent-child / discovered-from）
 python3 $T dep add <from> blocks <to>        # from 阻塞 to；環狀依賴會被拒絕並附具體環路徑
 python3 $T dep add <from> related <to>
