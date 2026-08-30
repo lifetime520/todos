@@ -330,6 +330,29 @@ def _warn_zero_hit_degrade(repo, config, provenance):
     print()
 
 
+def _warn_small_sample_degrade(repo, config, provenance, symbols, sym_index, files):
+    """符號樣本太小、命中率不具鑑別力時的降級警告。
+
+    與 _warn_zero_hit_degrade() 分開的理由是前因不同、修復動作也不同：
+    零命中是「search_dirs 一個檔都沒掃到」；這裡是「檔案掃到了，但待辦裡的
+    符號錨點太少，命中率無法用來判斷掃描層有沒有故障」。兩者共用同一份
+    config 診斷（zero_hit_diagnosis），因為最可能的修復都是調整掃描範圍
+    —— 實測兩起小樣本 FATAL 的根因都是掃描範圍，不是掃描器故障。
+    """
+    diag = todo_config.zero_hit_diagnosis(repo, config, provenance)
+    print(f'⚠️  WEAK_AUDIT：本次只有 {len(symbols)} 個符號錨點、命中 {len(sym_index)} 個'
+          f'（掃描 {len(files)} 個檔案），樣本太小，命中率無法用來判斷掃描層是否故障。')
+    print('   已降級照常產出結果 —— 但死碼偵測（GONE 判定）本次不可盡信，'
+          '每一條的狀態都會顯示為 WEAK_AUDIT。')
+    if diag['configured']:
+        print(f'   目前生效的 search_dirs = {diag["search_dirs"]}（來源：{diag["source"]}）')
+        print(f'   符號若其實存在、只是不在掃描範圍內，請檢查：{diag["per_repo_path"]}')
+    else:
+        print(f'   本專案未設定 search_dirs（找不到 {diag["per_repo_path"]}），沿用內建預設。')
+        print(f'   若這個 repo 的佈局與預設不同，建立設定檔即可：{json.dumps(diag["example"])}')
+    print()
+
+
 def build_commit_pool(repo, since):
     """全部 commit message，供「這條待辦是不是已經被做掉了」比對。"""
     out = subprocess.run(['git', 'log', f'--since={since}', '--date=short',
@@ -1003,14 +1026,39 @@ def main():
     # BTSE 佈局，才會走到降級），低命中率在這裡是預期結果、已經被
     # _warn_zero_hit_degrade() 警告過，不是「故障」，用同一道門檻攔截
     # 會讓 REQ-2 驗收 1（降級後不得 FATAL）失效。
+    # 這道門檻只有在「命中率」真的是一個率的時候才成立。0.30 這個值在
+    # len(symbols) <= 3 時會退化成「命中數是不是 0」—— 因為 1/3 = 33% 已經高於
+    # 門檻，n<=3 時唯一能觸發它的情形就是零命中。而零命中在小樣本下經常是良性的
+    # （符號被改名、或符號住在 scan_exts 之外的檔案），拿它當「掃描層故障」的
+    # 證據並中止整份稽核，是把雜訊當訊號。n>=4 起 1/4 = 25% 才開始能觸發，
+    # 這個率到那時才有鑑別力。
+    #
+    # 實測兩起，同一天、兩個獨立 repo，根因都是**掃描範圍**而非掃描器故障：
+    #   cast-power  0/1 = 0%  —— 純文件 repo，符號住在無副檔名的 scripts/castpower
+    #   todos       1/5 = 20% —— search_dirs 排除了 tests/（見 commit 60a80b0）
+    # 兩起都以 FATAL 收場、完全拿不到稽核結果；後者還得讀原始碼才找得到根因。
+    #
+    # 樣本太小時改走既有的 WEAK_AUDIT 降級，而不是放行：run 標記為降級後，
+    # todo_store.state_of() 會把每一條的狀態蓋成 WEAK_AUDIT，假陽性的 ALL_GONE
+    # 不可能被當成「可移除」—— 這道門檻原本要防的正是這件事，保護沒有被拿掉，
+    # 只是換成不會癱瘓整份稽核的形式。n 夠大時 FATAL 行為完全不變。
+    MIN_SYMBOLS_FOR_RATE = 4
     hit_rate = len(sym_index) / len(symbols) if symbols else 1.0
     if not degraded and symbols and hit_rate < 0.30:
-        sys.exit(
-            f'FATAL: 符號索引命中率僅 {hit_rate:.0%}（{len(sym_index)}/{len(symbols)}），'
-            f'掃描了 {len(files)} 個檔案。\n'
-            '這個比率不合理 —— 幾乎確定是掃描層故障而非「符號真的都不存在」。\n'
-            '中止以免把故障誤判成「可移除」。'
-        )
+        if len(symbols) < MIN_SYMBOLS_FOR_RATE:
+            _warn_small_sample_degrade(repo, config, provenance,
+                                       symbols, sym_index, files)
+            degraded = True
+        else:
+            sys.exit(
+                f'FATAL: 符號索引命中率僅 {hit_rate:.0%}（{len(sym_index)}/{len(symbols)}），'
+                f'掃描了 {len(files)} 個檔案。\n'
+                '這個比率不合理 —— 幾乎確定是掃描層故障而非「符號真的都不存在」。\n'
+                '中止以免把故障誤判成「可移除」。\n'
+                f'先查掃描範圍再查掃描器：目前 search_dirs = {config["search_dirs"]}，'
+                f'scan_exts = {sorted(config["scan_exts"])}。\n'
+                f'符號若其實存在、只是不在這個範圍內，改 {repo}/.claude/todo-audit.json 即可。'
+            )
 
     commits = {c for a in all_anchors for c in a['commit']}
     commit_set = set()
