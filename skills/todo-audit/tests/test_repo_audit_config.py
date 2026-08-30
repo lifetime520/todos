@@ -79,20 +79,6 @@ class TestRepoAuditConfigFile(RepoAuditConfigFixture):
         self._load_config_json()
 
     # REQ-5
-    def test_search_dirs_excludes_tests_directory(self):
-        # todo_audit.py:289-292 的既有註解明講：把測試碼算進生產碼符號掃描
-        # 範圍，會讓死碼偵測失能——已刪除的產品碼因為符號仍出現在測試裡，
-        # 會被誤判成「還活著」。search_dirs 裡的每一個目錄都不能指向測試目錄。
-        data = self._load_config_json()
-        search_dirs = data.get('search_dirs', [])
-        for d in search_dirs:
-            parts = Path(d).parts
-            self.assertNotIn(
-                'tests', parts,
-                f'search_dirs 內的 {d!r} 指向測試目錄，會讓死碼偵測失能',
-            )
-
-    # REQ-5
     def test_scan_exts_covers_python_shell_and_markdown(self):
         # Stage 2 實測：本 repo 實際分布在 skills/（.py、SKILL.md）、
         # hooks/（.sh）、docs/（.md）。三種副檔名缺一個，對應目錄下的檔案
@@ -141,6 +127,82 @@ class TestCollectSourceFilesWithRepoConfig(RepoAuditConfigFixture):
             len(files), 1,
             f'掃到 {len(files)} 個檔案 —— 套用 repo config 後命中數應該遠大於 1'
             '（沿用內建 SEARCH_DIRS 時，本 repo 沒有那些 Gradle 目錄，命中數固定卡在 1）',
+        )
+
+    # REQ-7（推翻 REQ-5「search_dirs 排除 tests/」的舊決策）
+    #
+    # 舊測試 test_search_dirs_excludes_tests_directory 鎖的是「設定長什麼
+    # 樣」——斷言 search_dirs 的每個目錄都不含 'tests'。把它反過來寫成
+    # 「必須包含 tests」同樣是鎖設定值：換個目錄名稱、或用別的方式涵蓋
+    # 測試檔，這種寫法一樣會誤報。這裡改斷言「設定達成的行為」：套用
+    # 這份設定後，符號索引的命中率不會低到觸發 todo_audit.py:1007 的
+    # FATAL 門檻（0.30）。
+    #
+    # 真實觸發問題的符號來自正式待辦 DB（T-003/T-005/T-006 的錨點指向
+    # 測試檔），但正式 DB 是全機唯一的單例，本 task 全程禁止跑
+    # `todo_cli.py audit` 去讀它。改用一組「自己構造、但確實存在於本
+    # repo」的探針符號來頂替：全部是只定義在 skills/todo-audit/tests/
+    # 底下、在 search_dirs 目前涵蓋的其餘目錄（scripts/hooks/docs）
+    # 完全不出現的 identifier ——這正是「錨點指向測試檔」這種待辦條目
+    # 在符號索引裡的真實形狀，不是憑空編造的假符號。
+    #
+    # 之所以敢用一組固定的符號名稱而不算「鎖設定值」：這些名稱是
+    # __被測物__（本 repo 現有測試碼），不是被斷言的設定值本身；斷言的
+    # 落點永遠是 hit_rate 這個比例，不是 search_dirs 的字面內容。
+    #
+    # 兩種設定下的命中率刻意隔得很開（0% vs 100%，皆遠離 0.30 的
+    # 門檻），而不是卡在臨界值附近，這樣測試才不會對「探針symbol剛好
+    # 也在別處出現」這種巧合敏感。
+    def test_symbols_only_defined_in_tests_dir_clear_fatal_hit_rate_threshold(self):
+        self._require_config_path()
+
+        # 每一個都已用 grep 逐一核對過：只出現在 skills/todo-audit/tests/
+        # 底下的 .py 檔，在 scripts/、hooks/、docs/ 完全零命中——分別來自
+        # 4 個不同的測試檔，避免探針集中在單一檔案而失去代表性。
+        probe_symbols = {
+            'RepoAuditConfigFixture',                                    # test_repo_audit_config.py
+            'TestSetSectionStoreLevel',                                  # test_section.py
+            'TestLatestSnapshotTwoStageResolution',                      # test_fixtures_resolution.py
+            'test_returns_none_when_neither_real_nor_fixture_exists',    # test_fixtures_resolution.py
+            'TestReadCommands',                                          # test_cli.py
+        }
+
+        empty_home = tempfile.TemporaryDirectory()
+        self.addCleanup(empty_home.cleanup)
+
+        defaults = {
+            'search_dirs': list(todo_audit.SEARCH_DIRS),
+            'scan_exts': list(todo_audit.SCAN_EXTS),
+        }
+        config, provenance, warnings = todo_config.load_config(
+            REPO_ROOT, defaults, home=Path(empty_home.name))
+
+        self.assertFalse(warnings, f'載入 repo config 不應產生警告：{warnings}')
+        self.assertEqual(
+            provenance['search_dirs'], 'per-repo',
+            'search_dirs 應該由 repo 根目錄的 .claude/todo-audit.json 決定，'
+            '不是內建的 BTSE Gradle 路徑',
+        )
+
+        files, _by_name = todo_audit.collect_source_files(REPO_ROOT, config=config)
+        sym_index = todo_audit.build_symbol_index(probe_symbols, files)
+        hit_rate = len(sym_index) / len(probe_symbols)
+
+        # 0.30 抄自 todo_audit.py:1007 的 FATAL 門檻字面值——那裡是行內
+        # 常數，沒有具名常數可 import，所以這裡刻意重複這個數字並用
+        # 註解釘住來源。若未來那個門檻改了，這條斷言要跟著同步，否則
+        # 兩邊會各說各話（這是本測試唯一的維護代價，已在報告中揭露）。
+        FATAL_HIT_RATE_THRESHOLD = 0.30
+        self.assertGreaterEqual(
+            hit_rate, FATAL_HIT_RATE_THRESHOLD,
+            f'探針符號命中率僅 {hit_rate:.0%}（{len(sym_index)}/{len(probe_symbols)}，'
+            f'掃描了 {len(files)} 個檔案)——探針符號 {sorted(probe_symbols)} 全部'
+            '只定義在 skills/todo-audit/tests/ 底下，模擬的正是真實待辦錨點'
+            '指向測試檔的情形（T-003/T-005/T-006）。命中率低於 '
+            'todo_audit.py:1007 的 FATAL 門檻代表現在的 search_dirs 排除了'
+            '測試目錄，真的跑 `todo_cli.py audit` 會直接中止。'
+            '修法：把 skills/todo-audit/tests 加進 .claude/todo-audit.json 的'
+            ' search_dirs（並視情況把 scan_exts 對齊測試檔的副檔名）。',
         )
 
 
