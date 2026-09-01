@@ -1,10 +1,11 @@
 {
-  "_comment": "per-repo todo-audit 設定：本 repo 是純 Python/Bash 工具倉庫，不是 BTSE Gradle 專案，內建的 SEARCH_DIRS（agent/src/main 等）在這裡零命中，會讓 collect_source_files() 降級為全 repo 掃描並印出 WEAK_AUDIT 警告。search_dirs 涵蓋生產碼、文件，以及 skills/todo-audit/tests（REQ-7，推翻先前排除測試目錄的決策）。todo_audit.py:289-292 的既有註解建議把測試碼排除在符號掃描之外，理由是測試裡殘留的符號引用會讓已刪除的產品碼被誤判成『還活著』，讓死碼偵測失能——這個顧慮對 BTSE 那類『生產碼與測試碼分離、待辦錨點主要指向生產碼』的專案成立。但本 repo 性質不同：這是一個以測試為核心的工具倉庫（315 個測試），待辦條目的錨點大量直接指向測試檔（例如 T-003/T-005/T-006）。排除 tests/ 曾在主 session 對正式待辦 DB 實跑 `todo_cli.py audit` 時造成符號索引命中率僅 20%（1/5），觸發 todo_audit.py:1006-1009 的 `hit_rate < 0.30` FATAL 門檻，直接中止整個稽核——這不是『符號真的都不存在』，是掃描範圍設錯。納入 tests/ 後同一批符號命中率回到 80%（4/5），稽核正常跑完。已知代價：納入測試碼確實可能讓『符號只剩測試在用、生產零呼叫端』這種死碼特徵在少數情況下驗不出來（殘留在測試裡的符號會讓已刪除的產品碼看起來還活著），但這是保守方向的偽陽性——後果是『該刪的沒被標出來』，不會誤刪任何東西；而 FATAL 中止是整個稽核完全癱瘓，兩害相權，本 repo 選擇不癱瘓。實測（Stage 8）也證實死碼偵測仍在運作：該次 audit 仍正確排除了 1 個『從未存在於 git 歷史』的假 GONE 訊號。",
+  "_comment": "per-repo todo-audit 設定：本 repo 是純 Python/Bash 工具倉庫，不是 BTSE Gradle 專案，內建的 SEARCH_DIRS（agent/src/main 等）在這裡零命中，會讓 collect_source_files() 降級為全 repo 掃描並印出 WEAK_AUDIT 警告。search_dirs 涵蓋生產碼、文件，以及 skills/todo-audit/tests（REQ-7，推翻先前排除測試目錄的決策）。todo_audit.py:289-292 的既有註解建議把測試碼排除在符號掃描之外，理由是測試裡殘留的符號引用會讓已刪除的產品碼被誤判成『還活著』，讓死碼偵測失能——這個顧慮對 BTSE 那類『生產碼與測試碼分離、待辦錨點主要指向生產碼』的專案成立。但本 repo 性質不同：這是一個以測試為核心的工具倉庫（340 個測試），待辦條目的錨點大量直接指向測試檔（例如 T-003/T-005/T-006）。排除 tests/ 曾在主 session 對正式待辦 DB 實跑 `todo_cli.py audit` 時造成符號索引命中率僅 20%（1/5），觸發 todo_audit.py:1006-1009 的 `hit_rate < 0.30` FATAL 門檻，直接中止整個稽核——這不是『符號真的都不存在』，是掃描範圍設錯。納入 tests/ 後同一批符號命中率回到 80%（4/5），稽核正常跑完。已知代價：納入測試碼確實可能讓『符號只剩測試在用、生產零呼叫端』這種死碼特徵在少數情況下驗不出來（殘留在測試裡的符號會讓已刪除的產品碼看起來還活著），但這是保守方向的偽陽性——後果是『該刪的沒被標出來』，不會誤刪任何東西；而 FATAL 中止是整個稽核完全癱瘓，兩害相權，本 repo 選擇不癱瘓。實測（Stage 8）也證實死碼偵測仍在運作：該次 audit 仍正確排除了 1 個『從未存在於 git 歷史』的假 GONE 訊號。\n\n【REQ-3 補充】skills/todo-audit/SKILL.md 是本 skill 最長的規格文件，記錄了「血淚教訓」等長期知識，待辦錨點可能直接指向它。納入時採「精確檔案路徑」而非放寬成 skills/todo-audit/ 目錄：精確路徑不會在未來有人於 skills/todo-audit/ 頂層新增檔案時，無感地把新增檔案一併納入符號掃描，放寬成目錄則會；既有兩筆已分別列出 scripts/ 與 tests/ 子目錄，維持逐項列舉才保持一致。SKILL.md 的性質（「文件裡含識別字」）與 docs/ 底下文件相同，兩者不該有不同待遇——這個改動消除了對稱性的破缺。理由也呼應 SKILL.md 第 2 條「血淚教訓」（檔案存在性與符號存在性需要不同掃描範圍）：SKILL.md 本身是符號掃描的對象，而不影響「只剩測試在用」的死碼判定。",
   "search_dirs": [
     "skills/todo-audit/scripts",
     "skills/todo-audit/tests",
     "hooks",
-    "docs"
+    "docs",
+    "skills/todo-audit/SKILL.md"
   ],
   "scan_exts": [
     ".py",

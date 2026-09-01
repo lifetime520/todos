@@ -206,6 +206,62 @@ class TestCollectSourceFilesWithRepoConfig(RepoAuditConfigFixture):
         )
 
 
+    # REQ-3
+    #
+    # `skills/todo-audit/SKILL.md` 是本 skill 最長的規格文件，記錄了「血淚
+    # 教訓」等長期知識，待辦錨點可能直接指向它。但它落在 skills/todo-audit/
+    # 底下、不在 search_dirs 目前列出的 scripts/ 或 tests/ 子目錄內，因此
+    # 掃不到——即使 docs/ 底下性質相同（「文件裡含識別字」）的檔案已被涵蓋，
+    # 兩者卻是兩套待遇。
+    #
+    # 斷言的是行為（這個檔案有沒有出現在 collect_source_files() 的回傳
+    # 集合裡），不是 search_dirs 的字面內容——理由同上面 :132-155 對
+    # test_symbols_only_defined_in_tests_dir_clear_fatal_hit_rate_threshold
+    # 的說明：斷言字面值只驗得到「設定長什麼樣」，換一種同樣能涵蓋
+    # SKILL.md 的寫法（例如改列更精確的父目錄）測試就會誤報成失敗。
+    #
+    # 刻意不斷言 len(files) 的精確數字（例如寫死 36 或 37）：collect_source_
+    # files() 掃的是整個 search_dirs 的即時內容，任何人在 scripts/、
+    # tests/、hooks/、docs/ 底下新增或刪除一個受 scan_exts 涵蓋的檔案，
+    # 這個數字就會變動——那是這些目錄的正常演進，不是 REQ-3 這個行為
+    # （「SKILL.md 有沒有被掃到」）該負責看住的事。requirements.md 的
+    # 驗收判準要求「N 必須等於 37」，但那是一次性的量測基準（改動前後
+    # 各量一次、取差集），不是這個測試該鎖死的不變式；把它寫成
+    # assertEqual(len(files), 37) 會在任何一次無關的檔案新增/刪除時
+    # 誤紅，是恆真斷言的反面——「恆假」風險同樣違反 REQ-1 要根治的
+    # 「斷言的對象選錯」問題。詳細判斷見 task-3-qa-report.md。
+    def test_collect_source_files_includes_skill_md(self):
+        self._require_config_path()
+
+        empty_home = tempfile.TemporaryDirectory()
+        self.addCleanup(empty_home.cleanup)
+
+        defaults = {
+            'search_dirs': list(todo_audit.SEARCH_DIRS),
+            'scan_exts': list(todo_audit.SCAN_EXTS),
+        }
+        config, provenance, warnings = todo_config.load_config(
+            REPO_ROOT, defaults, home=Path(empty_home.name))
+
+        self.assertFalse(warnings, f'載入 repo config 不應產生警告：{warnings}')
+        self.assertEqual(
+            provenance['search_dirs'], 'per-repo',
+            'search_dirs 應該由 repo 根目錄的 .claude/todo-audit.json 決定，'
+            '不是內建的 BTSE Gradle 路徑',
+        )
+
+        files, _by_name = todo_audit.collect_source_files(REPO_ROOT, config=config)
+        skill_md = REPO_ROOT / 'skills' / 'todo-audit' / 'SKILL.md'
+        self.assertIn(
+            skill_md, files,
+            f'{skill_md} 不在 collect_source_files() 回傳的符號掃描集合內 —— '
+            '.claude/todo-audit.json 的 search_dirs 需要新增 '
+            '"skills/todo-audit/SKILL.md" 這個精確檔案路徑（REQ-3）。'
+            '它是本 skill 最長的規格文件，待辦錨點指向它時目前驗不出來，'
+            '而性質相同的 docs/ 底下文件已經被涵蓋，兩者不該有不同待遇。',
+        )
+
+
 class TestConfigFileIsNotGitignored(RepoAuditConfigFixture):
     """REQ-6：`.claude/todo-audit.json` 必須能進版控，不能被 `.gitignore:34`
     的 `.claude/` 規則擋住。
