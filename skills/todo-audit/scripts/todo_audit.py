@@ -20,15 +20,55 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import todo_config
 
 # ── anchor 抽取規則 ────────────────────────────────────────────────
+# 檔案錨點的副檔名清單。**可由 per-repo config 的 `anchor_exts` 覆寫**，見 set_anchor_exts()。
+#
+# 副檔名清單漏一個就漏一整類錨點——實測 `.gradle` 缺席，導致 fastTest N 常數那 3 條
+# 重複條目全部抽不到錨點而配不上對。
+#
+# 為什麼要做成可設定，而不是直接把 md 加進預設值：這份清單決定「todo 文字裡什麼
+# 字串算是檔案錨點」，那取決於該專案的產物是什麼。純文件 repo（skill／規格庫）的
+# 主體是 markdown，`SKILL.md:284` 這種引用在預設清單下抽不出任何錨點，稽核對它
+# 幾乎失效（實測 cast-power 3 條待辦全部落在 NO_ANCHOR）。但**全域加 md 不安全**：
+# 實測 tradingbot 的 233 條待辦會多出 21 個查無此檔的錨點——`~/.claude/…` 底下的
+# 檔案，以及 analysis.md／bindings.md 這類跑完就刪的 workspace 產物。而檔案錨點
+# **沒有**符號那條「從未存在於 git 歷史 → 不算 GONE 訊號」的過濾（見 build_checks()），
+# 所以那 21 個會直接變成假 GONE，正是本工具最怕的「把仍成立的待辦標成可移除」。
+#
+# 兩條 regex 共用同一份清單。它們原本各有一份且**不一致**（RE_FILE_LINE 少了 `js`）；
+# 統一後等於補上 js，實測對 cast-power／todos／tradingbot 三個 repo 的 file_line
+# 錨點數皆為 0 變化，是行為中性的整併。
+ANCHOR_EXTS = ('java', 'ts', 'tsx', 'js', 'sql', 'gradle', 'properties',
+               'css', 'mjs', 'cjs', 'sh', 'yml', 'yaml')
+
+
+def _build_file_regexes(exts):
+    """由副檔名清單組出 (file:line, 裸檔名) 兩條 regex。
+
+    兩者的字元集刻意不同：file:line 允許 `/`（引用常帶路徑），裸檔名不允許
+    （避免把路徑片段吃進來）。這是既有行為，本次整併不動它。
+    """
+    alt = '|'.join(re.escape(e) for e in exts)
+    return (
+        re.compile(rf'([A-Za-z0-9_/.\-]+\.(?:{alt})):(\d+)'),
+        re.compile(rf'\b([A-Za-z0-9_\-]+\.(?:{alt}))\b'),
+    )
+
+
 # file:line —— 最強的錨點，同時給出存在性與位置
-RE_FILE_LINE = re.compile(
-    r'([A-Za-z0-9_/.\-]+\.(?:java|ts|tsx|sql|gradle|properties|css|mjs|cjs|sh|yml|yaml)):(\d+)'
-)
-# 裸檔名（無行號）。副檔名清單漏一個就漏一整類錨點——實測 `.gradle` 缺席，
-# 導致 fastTest N 常數那 3 條重複條目全部抽不到錨點而配不上對。
-RE_FILE = re.compile(
-    r'\b([A-Za-z0-9_\-]+\.(?:java|ts|tsx|js|sql|mjs|cjs|sh|gradle|properties|css|yml|yaml))\b'
-)
+RE_FILE_LINE, RE_FILE = _build_file_regexes(ANCHOR_EXTS)
+
+
+def set_anchor_exts(exts):
+    """依 config 重建兩條檔案錨點 regex。
+
+    刻意改寫 module 級 global，而不是把 exts 一路傳進 extract_anchors()：
+    extract_anchors() 有多個呼叫點（稽核主流程、similar_mode 的寫入前重複提示、
+    api_batch、api_groups）。只改主流程會讓「寫入前提示」與「稽核」用不同的錨點
+    定義，那種不一致比 global 難看的問題嚴重得多——同一條 todo 在兩個地方會被
+    算出不同的錨點集合。
+    """
+    global RE_FILE_LINE, RE_FILE
+    RE_FILE_LINE, RE_FILE = _build_file_regexes(exts)
 # SQL 表名／欄位：要求含底線，避免把一般大寫英文詞誤判
 RE_SQL = re.compile(r'\b([A-Z][A-Z0-9]*_[A-Z0-9_]{2,})\b')
 # config key：三段以上的點分小寫路徑，如 ai.signal.producer.interval-ms
@@ -975,6 +1015,14 @@ def main():
         sys.exit(1)
     todo_path, repo = Path(sys.argv[1]), Path(sys.argv[2])
 
+    # config 必須在**任何** extract_anchors() 之前載入：anchor_exts 決定錨點怎麼抽，
+    # 而下面 --similar／--batch／--groups 這些早退分支也會抽錨點。載入放在這裡，
+    # 是為了讓所有分支共用同一份錨點定義（見 set_anchor_exts() 的說明）。
+    defaults = {'search_dirs': list(SEARCH_DIRS), 'scan_exts': list(SCAN_EXTS),
+                'anchor_exts': list(ANCHOR_EXTS)}
+    config, provenance, _ = todo_config.load_config(repo, defaults)
+    set_anchor_exts(config['anchor_exts'])
+
     if '--stats' in sys.argv:
         api_stats(todo_path); return
     if '--groups' in sys.argv:
@@ -1002,8 +1050,7 @@ def main():
     todos = load_todos(todo_path)
     all_anchors = [extract_anchors(t) for t in todos]
 
-    defaults = {'search_dirs': list(SEARCH_DIRS), 'scan_exts': list(SCAN_EXTS)}
-    config, provenance, _ = todo_config.load_config(repo, defaults)
+    # config 已在 main() 開頭載入（anchor_exts 要早於 extract_anchors），這裡直接用。
     files, by_name = collect_source_files(repo, config)
     # REQ-2：search_dirs 零命中不再 sys.exit FATAL —— 改為降級掃全 repo，
     # 並全程標記為 WEAK_AUDIT（run 級旗標，見 persist()/todo_store.state_of()）。
