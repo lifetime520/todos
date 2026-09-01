@@ -110,16 +110,31 @@ class TestAllProjectsUnion(unittest.TestCase):
 
         self.assertIn('tradingbot', result)
 
-    # REQ-2：同一專案兩個來源都有時，all_projects() 不重複計數。
+    # REQ-1：同一專案兩個來源都有時只計一次，且不同來源各自獨有的專案都不能漏（聯集）。
     def test_project_present_in_both_sources_counted_once(self):
         (self.real_dir / 'tradingbot-pre-migrate-20260101-000000.md').write_text(
             'r', encoding='utf-8')
+        (self.real_dir / 'widgetco-pre-migrate-20260101-000000.md').write_text(
+            'w', encoding='utf-8')
         (self.synth_dir / 'tradingbot.md').write_text('s', encoding='utf-8')
+        (self.synth_dir / 'acme.md').write_text('a', encoding='utf-8')
 
         with self._patched():
             result = fixtures.all_projects()
 
-        self.assertEqual(result.count('tradingbot'), 1)
+        # 三個專案分別覆蓋三種「漏讀就測不出來」的壞實作：
+        # - tradingbot：兩個來源都有 → 只能出現一次。若去重失效（set 換成
+        #   list）會重複出現，元素數變多而紅。
+        # - widgetco：只存在於真實備份來源（AUDIT）。若漏讀 AUDIT 來源，
+        #   它會從結果中消失，元素數變少而紅。
+        # - acme：只存在於合成 fixture 來源（FIXTURES_DIR）。若漏讀
+        #   FIXTURES_DIR 來源，它會從結果中消失，元素數變少而紅——這是
+        #   下面那條原始斷言測不到的壞實作，也是本次補強的重點。
+        # acme 字母序排最前，順帶驗證 all_projects() 有 sorted()。
+        #
+        # 原始的 `count('tradingbot') == 1` 斷言只在「以 set 去重的實作」前提
+        # 下恆為真，因此對「漏讀某個來源」測不出來。
+        self.assertEqual(result, ['acme', 'tradingbot', 'widgetco'])
 
 
 if __name__ == '__main__':
