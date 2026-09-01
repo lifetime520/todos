@@ -6,6 +6,18 @@
   > 💡  這筆條目出現在任何 heading 之前，section 應由標題殘留的 [P0] 推導為 urgent
   > 🏷️  fallback, no-heading
 
+- [ ] [P2] 尚無 heading 時用標題關鍵字判斷 section 應為 later
+  > 💡  這筆條目出現在任何 heading 之前，section 應由標題殘留的 [P2] 推導為 later
+  > 🏷️  fallback, no-heading
+
+- [ ] [Cast 拍板] 尚無 heading 時用標題關鍵字判斷 section 應為 decision
+  > 💡  這筆條目出現在任何 heading 之前，section 應由標題殘留的 [Cast 拍板] 推導為 decision
+  > 🏷️  fallback, no-heading
+
+- [ ] 尚無 heading 且標題無特殊標記時 section 應為 normal
+  > 💡  這筆條目出現在任何 heading 之前，標題沒有 [P0]/[Cast 拍板]/[P2] 任何標記，應落回預設的 normal
+  > 🏷️  fallback, no-heading
+
 ## 🔴 立即處理（P0 / 資金安全）（1）
 
 - [ ] [2026-08-01] 風控閾值檢查缺漏
