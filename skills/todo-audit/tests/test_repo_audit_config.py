@@ -1,8 +1,7 @@
 """REQ-5：repo 根目錄需要 `.claude/todo-audit.json`，消除 `todo_audit.py` 的
 `⚠️  WEAK_AUDIT` 零命中降級。
 
-背景（`.castpower/todo-audit-testability/requirements.md` REQ-5 / analysis.md
-「REQ-5：`.claude/todo-audit.json`」節）：本 repo（純 Python/Bash 工具倉庫）
+背景（REQ-5）：本 repo（純 Python/Bash 工具倉庫）
 沒有任何層級的 `todo-audit.json`，`collect_source_files()`
 （`todo_audit.py:274-305`）在 `config is None` 時落到內建 `SEARCH_DIRS`
 （BTSE Gradle 路徑：`agent/src/main`/`core/src/main`/... ），本 repo 完全沒有
@@ -220,16 +219,18 @@ class TestCollectSourceFilesWithRepoConfig(RepoAuditConfigFixture):
     # 的說明：斷言字面值只驗得到「設定長什麼樣」，換一種同樣能涵蓋
     # SKILL.md 的寫法（例如改列更精確的父目錄）測試就會誤報成失敗。
     #
-    # 刻意不斷言 len(files) 的精確數字（例如寫死 36 或 37）：collect_source_
-    # files() 掃的是整個 search_dirs 的即時內容，任何人在 scripts/、
-    # tests/、hooks/、docs/ 底下新增或刪除一個受 scan_exts 涵蓋的檔案，
-    # 這個數字就會變動——那是這些目錄的正常演進，不是 REQ-3 這個行為
-    # （「SKILL.md 有沒有被掃到」）該負責看住的事。requirements.md 的
-    # 驗收判準要求「N 必須等於 37」，但那是一次性的量測基準（改動前後
-    # 各量一次、取差集），不是這個測試該鎖死的不變式；把它寫成
-    # assertEqual(len(files), 37) 會在任何一次無關的檔案新增/刪除時
-    # 誤紅，是恆真斷言的反面——「恆假」風險同樣違反 REQ-1 要根治的
-    # 「斷言的對象選錯」問題。詳細判斷見 task-3-qa-report.md。
+    # 刻意不斷言 len(files) 的精確數字：collect_source_files() 掃的是整個
+    # search_dirs 的即時內容，任何人在 scripts/、tests/、hooks/、docs/
+    # 底下新增或刪除一個受 scan_exts 涵蓋的檔案，這個數字就會變動——那是
+    # 這些目錄的正常演進，不是 REQ-3 這個行為（「SKILL.md 有沒有被掃到」）
+    # 該負責看住的事。把它寫成 assertEqual(len(files), <某個絕對數字>)
+    # 會在任何一次無關的檔案新增/刪除時誤紅，是恆真斷言的反面——
+    # 「恆假」風險同樣違反 REQ-1 要根治的「斷言的對象選錯」問題。
+    # 真正該鎖住的不變式，是「在 search_dirs 裡加入 SKILL.md 這條設定，
+    # 前後 collect_source_files() 回傳集合的差集恰好是
+    # skills/todo-audit/SKILL.md 這一個檔」——用差集而非絕對數字驗證，
+    # 才不會被其他目錄的正常增減污染。下面直接用 assertIn 斷言 SKILL.md
+    # 本身在回傳集合內，而不是斷言集合大小，就是同一個理由的落地。
     def test_collect_source_files_includes_skill_md(self):
         self._require_config_path()
 
@@ -266,7 +267,7 @@ class TestConfigFileIsNotGitignored(RepoAuditConfigFixture):
     """REQ-6：`.claude/todo-audit.json` 必須能進版控，不能被 `.gitignore:34`
     的 `.claude/` 規則擋住。
 
-    背景（`.castpower/todo-audit-testability/requirements.md` REQ-6）：
+    背景（REQ-6）：
     Stage 4b 完成後對帳發現這個檔在本機存在、測試也全綠，但 `.gitignore:34`
     的 `.claude/` 規則把它擋住了——它永遠不會進入任何 commit，任何 clone
     與 CI 都拿不到它，`WEAK_AUDIT` 依舊存在。這是回歸保護測試：防的是未來
