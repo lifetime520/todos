@@ -23,10 +23,10 @@ from pathlib import Path
 
 CONFIG_RELPATH = Path('.claude') / 'todo-audit.json'
 
-# Stage 7 第四輪裁決（2026-08-21）：只對這兩個鍵做型別檢查，值必須是
+# Stage 7 第四輪裁決（2026-08-21）：只對 TYPED_LIST_KEYS 這幾個鍵做型別檢查，值必須是
 # list[str]。不建完整 schema 驗證框架 —— 其他未知鍵不受此規則限制，
 # 那是既有的「未知鍵靜默併入」行為，不在本次修復範圍。
-TYPED_LIST_KEYS = ('search_dirs', 'scan_exts')
+TYPED_LIST_KEYS = ('search_dirs', 'scan_exts', 'anchor_exts')
 
 
 def config_paths(repo_root, home=None):
@@ -44,7 +44,7 @@ def _typed_key_error(layer):
     """檢查 TYPED_LIST_KEYS 內的鍵（若存在於這一層）是否為 list[str]。
 
     回傳 (key, value) 描述第一個型別錯誤的鍵；全部合法則回傳 None。
-    只驗 search_dirs/scan_exts 這兩個鍵 —— 其他未知鍵不受此規則限制，
+    只驗 TYPED_LIST_KEYS（search_dirs／scan_exts／anchor_exts）—— 其他未知鍵不受此規則限制，
     那是既有的「未知鍵靜默併入」行為，這裡刻意不動〔Stage 7 第四輪裁決〕。
     """
     for key in TYPED_LIST_KEYS:
@@ -69,7 +69,7 @@ def _load_layer(path):
     「非法內容」涵蓋兩種情況，處理方式統一（都是印 WARN + 回 (None, warning)，
     呼叫端 load_config() 不需要知道是哪一種）：
     - JSON 語法錯誤（原有邏輯）
-    - search_dirs/scan_exts 型別錯誤（Stage 7 第四輪裁決新增）：值必須是
+    - TYPED_LIST_KEYS 型別錯誤（Stage 7 第四輪裁決新增）：值必須是
       list[str]，否則實跑會在下游炸 TypeError（數字）或被當可迭代物
       逐字元展開（字串），且後者不 crash、doctor 卻誤報 OK——比 crash
       更危險的靜默失效。

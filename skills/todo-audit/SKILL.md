@@ -151,6 +151,16 @@ DB 在 `~/.claude/todos/.audit/{project}.sqlite` —— 天然按專案隔離，
 **2. 檔案存在性與符號存在性需要不同掃描範圍。**
 `build.gradle` 在 repo root、測試在 `src/test` —— 只掃 `src/main` 會把它們判成「檔案已消失」。但符號掃描**必須**只看生產碼，否則「只剩測試在用、生產零呼叫端」這種死碼特徵就驗不出來。
 
+**2b. 「什麼字串算檔案錨點」也是專案相依的，而且不能全域放寬。**
+`RE_FILE`／`RE_FILE_LINE` 的副檔名清單沒有 `md`，所以純文件 repo（skill／規格庫）裡
+`SKILL.md:284` 這種引用抽不出任何錨點，稽核對它幾乎失效——實測 cast-power 的 3 條待辦全部落在 `NO_ANCHOR`。
+但**全域加 `md` 不安全**：實測 tradingbot 的 233 條待辦會多出 **21 個查無此檔的錨點**
+（`~/.claude/…` 底下的檔、以及 `analysis.md`／`bindings.md` 這類跑完就刪的 workspace 產物）。
+關鍵在下面這條不對稱——檔案錨點**沒有**符號那條「從未存在於 git 歷史 → 不算 GONE 訊號」的過濾
+（`build_checks()` 對 file 是 `OK if hits else GONE`），所以那 21 個會直接變成假 GONE。
+→ 改成 per-repo 可設定的 `anchor_exts`（預設清單一字未改），需要的 repo 自己在
+`.claude/todo-audit.json` 開。**opt-in 的理由不是保守，是量出來的**：同一個改動在 A repo 是修復、在 B repo 是 21 個假 GONE。
+
 **3. 錨點存活 ≠ 命題成立。**
 主流的過期型態是「**符號還在、狀態變了**」。例：todo 說 `recordPnl` 零呼叫端是死碼，而它現在已經被接上 —— 符號完好，命題已死。純錨點驗證對此完全無感（召回 1/9）。這是加入 git pickaxe 的原因。
 
