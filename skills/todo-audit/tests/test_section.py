@@ -140,5 +140,152 @@ class TestEditSectionCliLevel(unittest.TestCase):
         self.assertEqual(r.returncode, 0, out)
 
 
+class TestSetSectionWritesFullHeadingLine(unittest.TestCase):
+    """REQ-4：set_section() 寫入完整標頭行，而非裸符號。
+
+    `todo.heading` 欄的不變式只到「完整標頭行」這一層，不到「必為某份 md
+    檔的原文」（見 `todo_store.py` schema 註解 :26-39）：`parse_md_lossless()`
+    → `save_parsed()` 這條路徑寫入的是解析既有 md 檔得到的標頭原文整行
+    （例如 `## 🔴 立即處理（P0 / 資金安全）（1）`）；`set_section()` 這條
+    路徑寫入的則是 `_SECTION_HEADING` 表合成出來的 canonical 整行（如
+    `## 🔴 緊急`），不保證對應任何 md 檔裡真實存在的行。本類別鎖定的是
+    `set_section()` 這條路徑，用 `assertEqual` 斷言字面值，因為它過去曾
+    直接寫入裸符號（如 `'🔴'`），與整行格式不一致；子字串比對
+    （`assertIn`）分不出兩者差異——`'## 🔴 緊急'` 與 `'🔴'` 都能讓
+    `assertIn('🔴', ...)` 成立。
+
+    對照：`test_set_section_updates_both_heading_and_section_columns`
+    （`:65`）用的就是 `assertIn('⚪', ...)`。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.con = todo_store.connect(Path(self.tmp.name) / 't.sqlite')
+        todo_store.save_parsed(self.con, 'demo',
+                               todo_store.parse_md_lossless(SAMPLE))
+        todo_store.assign_short_ids(self.con)
+        self.key = self.con.execute(
+            'SELECT key FROM todo WHERE sort_order=0').fetchone()[0]
+
+    def tearDown(self):
+        self.con.close()
+        self.tmp.cleanup()
+
+    def _heading_after_move(self, section):
+        todo_store.set_section(self.con, self.key, section)
+        return self.con.execute(
+            'SELECT heading FROM todo WHERE key=?', (self.key,)).fetchone()[0]
+
+    def test_set_section_writes_full_heading_line_for_urgent(self):
+        self.assertEqual(self._heading_after_move('urgent'), '## 🔴 緊急')
+
+    def test_set_section_writes_full_heading_line_for_decision(self):
+        self.assertEqual(self._heading_after_move('decision'), '## 🟠 待拍板決策')
+
+    def test_set_section_writes_full_heading_line_for_normal(self):
+        self.assertEqual(self._heading_after_move('normal'), '## 🟡 一般')
+
+    def test_set_section_writes_full_heading_line_for_later(self):
+        self.assertEqual(self._heading_after_move('later'), '## ⚪ 之後再看')
+
+    def test_set_section_writes_heading_starting_with_hash_marker(self):
+        """四種 section 皆須以 `'## '` 開頭——這是與裸符號的關鍵區別。
+
+        單獨列一條斷言 `startswith('## ')`，即使上面四條字面值比對已經隱含
+        這件事，也要讓「是不是整行標頭」這個判準有一個不依賴確切措辭、
+        只依賴格式的獨立錨點。
+        """
+        for section in ('urgent', 'decision', 'normal', 'later'):
+            with self.subTest(section=section):
+                heading = self._heading_after_move(section)
+                self.assertTrue(
+                    heading.startswith('## '),
+                    f'{section} 的 heading 不是完整標頭行：{heading!r}')
+
+
+class TestSectionOfResolvesNewHeadingLiteral(unittest.TestCase):
+    """REQ-4 行為不回歸：set_section() 寫入新標頭行後，
+    `_section_of(title, heading)` 仍能正確判定回同一個 section。
+
+    `_section_of()` 對 heading 是子字串比對（`sym in heading`），理論上符號
+    還在完整標頭行裡就不受影響；但這件事必須實測，不能只靠推論——萬一
+    canonical 標頭行的符號位置或組字方式讓 `in` 判斷失效，這裡會抓到。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.con = todo_store.connect(Path(self.tmp.name) / 't.sqlite')
+        todo_store.save_parsed(self.con, 'demo',
+                               todo_store.parse_md_lossless(SAMPLE))
+        todo_store.assign_short_ids(self.con)
+        self.key = self.con.execute(
+            'SELECT key FROM todo WHERE sort_order=0').fetchone()[0]
+
+    def tearDown(self):
+        self.con.close()
+        self.tmp.cleanup()
+
+    def _resolved_section_after_move(self, target_section):
+        todo_store.set_section(self.con, self.key, target_section)
+        heading = self.con.execute(
+            'SELECT heading FROM todo WHERE key=?', (self.key,)).fetchone()[0]
+        # 標題刻意不帶任何 [P0]/[Cast 拍板]/[P2] 標記，逼 _section_of()
+        # 只能靠 heading 判定——若判定失準，fallback 會把它誤判成 normal。
+        return todo_store._section_of('與 heading 判定無關的標題', heading)
+
+    def test_section_of_resolves_urgent_from_new_heading(self):
+        self.assertEqual(self._resolved_section_after_move('urgent'), 'urgent')
+
+    def test_section_of_resolves_decision_from_new_heading(self):
+        self.assertEqual(
+            self._resolved_section_after_move('decision'), 'decision')
+
+    def test_section_of_resolves_normal_from_new_heading(self):
+        self.assertEqual(self._resolved_section_after_move('normal'), 'normal')
+
+    def test_section_of_resolves_later_from_new_heading(self):
+        self.assertEqual(self._resolved_section_after_move('later'), 'later')
+
+
+class TestSetSectionKeepsSectionColumnQueryable(unittest.TestCase):
+    """REQ-4 行為不回歸：搬移後 `WHERE section=?`（`todo_cli.rows()` 的
+    查詢方式）仍撈得到該條目——heading 欄格式改變不該影響 section 欄的
+    獨立查詢，因為 `rows()` 從不現算 `_section_of()`，只讀 section 欄。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.con = todo_store.connect(Path(self.tmp.name) / 't.sqlite')
+        todo_store.save_parsed(self.con, 'demo',
+                               todo_store.parse_md_lossless(SAMPLE))
+        todo_store.assign_short_ids(self.con)
+        self.key = self.con.execute(
+            'SELECT key FROM todo WHERE sort_order=0').fetchone()[0]
+
+    def tearDown(self):
+        self.con.close()
+        self.tmp.cleanup()
+
+    def _keys_in_section(self, section):
+        return [r[0] for r in self.con.execute(
+            'SELECT key FROM todo WHERE section=?', (section,)).fetchall()]
+
+    def test_moved_key_is_queryable_by_section_column_for_decision(self):
+        todo_store.set_section(self.con, self.key, 'decision')
+        self.assertIn(self.key, self._keys_in_section('decision'))
+
+    def test_moved_key_is_queryable_by_section_column_for_normal(self):
+        todo_store.set_section(self.con, self.key, 'normal')
+        self.assertIn(self.key, self._keys_in_section('normal'))
+
+    def test_moved_key_is_queryable_by_section_column_for_later(self):
+        todo_store.set_section(self.con, self.key, 'later')
+        self.assertIn(self.key, self._keys_in_section('later'))
+
+    def test_moved_key_no_longer_queryable_under_original_urgent_section(self):
+        todo_store.set_section(self.con, self.key, 'later')
+        self.assertNotIn(self.key, self._keys_in_section('urgent'))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -25,8 +25,18 @@ MIGRATIONS = [
     "ALTER TABLE todo ADD COLUMN status_at TEXT",
     "ALTER TABLE todo ADD COLUMN status_note TEXT",
     "ALTER TABLE todo ADD COLUMN short_id TEXT",
-    # 條目所屬的 md 章節標頭原文。section 是它的有損投影
-    # （🟡 待辦 與 ⚪ 觀察/技術債 都塌成 normal），故原文另存一份。
+    # 條目所屬的 md 章節標頭整行。兩條寫入路徑各自負責填這欄，來源不同但
+    # 格式對齊：save_parsed()（:301 INSERT、:310 UPDATE）把 parse_md_lossless()
+    # 解析既有 md 檔得到的標頭原文整行寫入這欄；set_section()（人工搬章節）
+    # 寫入 _SECTION_HEADING 表合成出來的 canonical 整行（如 '## 🔴 緊急'）——
+    # 這行不保證對應任何 md 檔裡真實存在的行，是刻意仿照原文格式構造的。
+    # 兩者共同的不變式只到「完整標頭行」這一層，不到「必為某份 md 檔的
+    # 原文」——_section_of() 靠符號在整行裡出現與否判斷 section，只要整行
+    # 帶對符號，來源是解析還是合成都不影響判定結果，故沒有必要為人工路徑
+    # 另開分支或改存裸符號。
+    # section 是 heading 的有損投影（見 _HEADING_SECTION）：🟡 待辦塌成
+    # normal、⚪ 觀察/技術債塌成 later，故整行原文/canonical 另存一份，
+    # 供未來想印 heading 或據以重組 md 章節的人取用完整資訊。
     "ALTER TABLE todo ADD COLUMN heading TEXT",
     # 真實 md 行號，供 todo_audit.py 的報告輸出使用
     "ALTER TABLE todo ADD COLUMN md_line INT",
@@ -681,7 +691,7 @@ def edit_title(con, key, new_title):
     return new_key
 
 
-_SECTION_HEADING = {'urgent': '🔴', 'decision': '🟠', 'normal': '🟡', 'later': '⚪'}
+_SECTION_HEADING = {'urgent': '## 🔴 緊急', 'decision': '## 🟠 待拍板決策', 'normal': '## 🟡 一般', 'later': '## ⚪ 之後再看'}
 
 
 def set_section(con, key, section):
@@ -693,14 +703,14 @@ def set_section(con, key, section):
     rows() 是直接對 section 欄位做 WHERE section=?，不會重新用
     heading 現算 _section_of()。
     """
-    sym = _SECTION_HEADING.get(section)
-    if sym is None:
+    heading_line = _SECTION_HEADING.get(section)
+    if heading_line is None:
         raise ValueError(
             f'不支援的 section：{section}（限 {"/".join(_SECTION_HEADING)}）')
     if con.execute('SELECT 1 FROM todo WHERE key=?', (key,)).fetchone() is None:
         raise KeyError(key)
     con.execute('UPDATE todo SET heading=?, section=? WHERE key=?',
-                (sym, section, key))
+                (heading_line, section, key))
     con.commit()
 
 
