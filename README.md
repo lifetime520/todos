@@ -152,6 +152,34 @@ cd skills/todo-audit && python3 -m unittest discover -s tests -v
 
 不需要 pytest，標準庫 unittest 即可。
 
+### 做變異檢查時要隔離 `__pycache__`
+
+把被測物暫時改壞、確認測試變紅、再改回來 —— 這是驗證「一條測試是否真的
+可否證」最有力的手段，本 repo 的測試多半是這樣取證的。但它有一個會**靜默
+給出假綠**的失效模式：
+
+```bash
+cd skills/todo-audit && PYTHONPYCACHEPREFIX=/tmp/pyc python3 -m unittest discover -s tests
+```
+
+CPython 判斷 `.pyc` 要不要重新編譯，看的是來源檔的 **mtime（秒級精度）＋
+檔案大小**。而典型的變異恰好兩個條件都不會變：
+
+- `return 'urgent'` → `return 'normal'` 是**等長替換**，size 不變
+- 改壞、跑測試、改回來，全程往往在**同一秒**內完成，mtime 不變
+
+於是還原之後，Python 仍然載入變異過的 bytecode —— 「還原後測試全綠」這個
+結論本身是假的，而且沒有任何徵兆。**用 `PYTHONPYCACHEPREFIX` 把 cache 導到
+repo 外，或刻意讓變異前後長度不同**，兩者擇一即可。
+
+**它是間歇性的。** 2026-09-02 受控重現：把兩次寫入對齊到同一整數秒
+（`int(st_mtime)` 相等）＋等長替換，還原後載入的仍是變異版；但同樣的操作
+跨過秒邊界時完全正常。所以「我跑過一次沒事」不代表方法可靠 —— 只代表這次
+沒踩到。
+
+（2026-09-01 實地踩到：一次驗收的變異檢查因此假紅，換成隔離 cache 後才
+拿到正確結果。）
+
 ## 環境需求
 
 Python 3（標準庫，無外部依賴）、bash、git。開發與驗證環境為 macOS + Python 3.12。
