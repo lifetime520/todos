@@ -76,7 +76,7 @@ skills/todo-audit/
     todo_store.py    sqlite 儲存層、無損解析、短 ID 配發
     todo_audit.py    錨點抽取與取證比對
     migrate_md_to_db.py   舊版 markdown → sqlite 一次性遷移
-  tests/             104 個 unittest
+  tests/             340 個 unittest
 
 docs/
   TODO-SYSTEM.md     完整操作手冊：格式規範、三態語意、指令速查
