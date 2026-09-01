@@ -350,5 +350,61 @@ class TestSectionTablesShareOneSource(unittest.TestCase):
         self.assertEqual(todo_store._section_of('x', '## 🟢 未來規劃'), 'later')
 
 
+
+class TestDocsMatchSectionTable(unittest.TestCase):
+    """docs/TODO-SYSTEM.md 的章節對應表必須與 _SECTIONS 一致。
+
+    這條擋的是**文件漂移**：程式碼改了、文件沒跟上，而使用者是照文件寫 md 的。
+    實際發生過 —— 該文件的示範標頭長期寫著 `🔴 決策待定` / `🟡 待辦任務` /
+    `🟢 未來規劃`，既漏了 🟠 與 ⚪，又把 🔴 說成「決策待定」（程式碼裡 🔴 是
+    urgent、🟠 才是 decision）。照舊示範寫出來的 md 會被判成非預期的 section，
+    而沒有任何測試會紅。
+
+    刻意斷言「文件裡出現過這組對應」而不是逐字比對整份文件：後者會在任何
+    無關的文字編輯時誤紅，是恆假斷言。
+    """
+
+    def setUp(self):
+        repo_root = None
+        for c in [TESTS, *TESTS.parents]:
+            if (c / '.git').exists():
+                repo_root = c
+                break
+        if repo_root is None:
+            self.fail(f'從 {TESTS} 往上找不到含 .git 的目錄 —— '
+                      '這條測試要讀 repo 內的 docs/TODO-SYSTEM.md，'
+                      '必須在 repo checkout 裡執行')
+        self.doc = (repo_root / 'docs' / 'TODO-SYSTEM.md').read_text(encoding='utf-8')
+
+    def test_every_section_symbol_pair_documented(self):
+        """四組 (符號, section) 都要能在文件裡找到同一列。"""
+        for section, heading, syms in todo_store._SECTIONS:
+            canonical_sym = syms[0]
+            with self.subTest(section=section):
+                self.assertRegex(
+                    self.doc,
+                    rf'\|\s*{canonical_sym}\s*\|\s*`{section}`',
+                    f'docs/TODO-SYSTEM.md 的章節對應表缺少 {canonical_sym} → '
+                    f'{section} 這一列。程式碼改了 _SECTIONS 就要同步改文件 —— '
+                    '使用者是照文件寫 md 的。')
+
+    def test_no_stale_symbol_section_pairing_in_docs(self):
+        """文件不得把某個符號對到錯的 section。
+
+        只驗「有沒有列出」不夠 —— 舊文件的問題正是「列了，但對錯了」
+        （🔴 被說成決策待定）。這裡反向檢查每個符號在對應表裡只配到它
+        真正的 section。
+        """
+        sym_to_section = {syms[0]: section
+                          for section, _h, syms in todo_store._SECTIONS}
+        for sym, correct in sym_to_section.items():
+            for section, _h, _s in todo_store._SECTIONS:
+                if section == correct:
+                    continue
+                with self.subTest(symbol=sym, wrong=section):
+                    self.assertNotRegex(
+                        self.doc,
+                        rf'\|\s*{sym}\s*\|\s*`{section}`',
+                        f'文件把 {sym} 對到了 {section}，但程式碼裡它是 {correct}')
 if __name__ == '__main__':
     unittest.main()
