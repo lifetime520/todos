@@ -13,6 +13,12 @@
 「合成 fixture 目錄」，patch 掉 `fixtures.AUDIT` 與 `fixtures.FIXTURES_DIR`
 這兩個根目錄後才呼叫 `latest_snapshot()`/`all_projects()`。不依賴、不觸碰
 真實的 `~/.claude/todos/.audit/`。
+
+REQ 編號的作用域：本檔的 REQ-n 是「檢入合成 fixture 並改 latest_snapshot() 為兩段解析」那次交付（commit 907c6a4）的需求編號。
+本 repo 的 REQ 編號**逐檔案局部有效** —— 不同測試檔的 REQ-1 指涉
+完全不同的需求，不要跨檔對照。原始需求文件住在交付當下的 castpower
+工作目錄（`.castpower/`，被 gitignore 完全排除、不進版控），所以這裡
+指的是 **commit**：`git show 907c6a4` 永遠查得到，路徑不會。
 """
 import sys
 import tempfile

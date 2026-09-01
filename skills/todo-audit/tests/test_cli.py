@@ -1,3 +1,9 @@
+"""REQ 編號的作用域：本檔的 REQ-n 是初始提交（commit 207be1f）當時的需求編號的需求編號。
+本 repo 的 REQ 編號**逐檔案局部有效** —— 不同測試檔的 REQ-1 指涉
+完全不同的需求，不要跨檔對照。原始需求文件住在交付當下的 castpower
+工作目錄（`.castpower/`，被 gitignore 完全排除、不進版控），所以這裡
+指的是 **commit**：`git show 207be1f` 永遠查得到，路徑不會。
+"""
 import json
 import subprocess
 import sys

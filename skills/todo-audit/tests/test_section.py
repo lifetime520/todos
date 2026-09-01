@@ -1,16 +1,18 @@
 """set_section() 與 CLI `edit --section` 的測試（REQ-3）。
 
-只測 REQ-3；REQ-1/2/4/5 由其他 task 覆蓋。
-
-RED 期望：本檔在 `todo_store.set_section()` 尚未實作、`edit` subparser
-尚未加 `--section` 的樹上執行，應全部失敗——
-- store 層測試：`AttributeError: module 'todo_store' has no attribute
-  'set_section'`
-- CLI 層測試：argparse 對 `--section` 報 unrecognized argument（非零
-  exit，但不是「因為需求邏輯拒絕」，是「這個旗標根本不存在」）
+本檔涵蓋該次交付的 REQ-3；同批其餘 REQ 由別的測試檔覆蓋。
+（下方 TestSetSectionWritesFullHeadingLine 等類別標的 REQ-4 屬**另一次**
+交付 —— 待辦 T-006，見該類別自身的 docstring。這正是 REQ 編號逐檔局部
+有效、不可跨檔對照的實例。）
 
 沿用 test_store.py 的 DB fixture 寫法（TestEditAndRemove）與 test_cli.py
 的 run_cli 端到端寫法（TestEditRemoveCommands）。
+
+REQ 編號的作用域：本檔的 REQ-n 是「新增 edit --section 手動搬章節」那次交付（commit c540598）的需求編號。
+本 repo 的 REQ 編號**逐檔案局部有效** —— 不同測試檔的 REQ-1 指涉
+完全不同的需求，不要跨檔對照。原始需求文件住在交付當下的 castpower
+工作目錄（`.castpower/`，被 gitignore 完全排除、不進版控），所以這裡
+指的是 **commit**：`git show c540598` 永遠查得到，路徑不會。
 """
 import sys
 import tempfile

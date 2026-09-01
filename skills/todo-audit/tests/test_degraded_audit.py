@@ -1,6 +1,6 @@
 """REQ-2：SEARCH_DIRS 零命中時降級為全 repo 掃描，並全程標記為 WEAK_AUDIT。
 
-釘住 `.castpower/todo-audit-cfg/requirements.md` 的 REQ-2 五條驗收，含 G-1/G-2/G-6
+釘住該次交付 REQ-2 的五條驗收，含 G-1/G-2/G-6
 裁決後的正確版本：
   - G-1：WEAK_AUDIT 是 run 級旗標，probe.state 保留 classify() 的真值；
     todo_store.state_of() 才是顯示層取代的地方。
@@ -10,6 +10,12 @@
 
 這些測試會實際跑 `todo_audit.py` 主流程（含真實 git 子行程），因此每個測試都自建一個
 一次性的臨時 git repo；HOME 一律指向 tempfile，不得碰真實 `~/.claude/todos`。
+
+REQ 編號的作用域：本檔的 REQ-n 是「掃描範圍改三層 config 合併」那次交付（commit ebad63a）的需求編號。
+本 repo 的 REQ 編號**逐檔案局部有效** —— 不同測試檔的 REQ-1 指涉
+完全不同的需求，不要跨檔對照。原始需求文件住在交付當下的 castpower
+工作目錄（`.castpower/`，被 gitignore 完全排除、不進版控），所以這裡
+指的是 **commit**：`git show ebad63a` 永遠查得到，路徑不會。
 """
 import json
 import os

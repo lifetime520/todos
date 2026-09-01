@@ -1,6 +1,6 @@
 """REQ-1：掃描範圍改為三層 config（builtin < user-global < per-repo），deep merge + provenance。
 
-這份測試釘住 `.castpower/todo-audit-cfg/requirements.md` 的 REQ-1 七條驗收。
+這份測試釘住該次交付 REQ-1 的七條驗收。
 
 介面契約（尚不存在，本檔案預期在 import 階段就 ImportError —— 合格的 RED）：
     import todo_config
@@ -16,6 +16,12 @@
     - user-global config 路徑固定為 `<home>/.claude/todo-audit.json`
     - 非法 JSON 只讓該層失效，其餘層照常合併；該次呼叫必須印出可辨識的警告
       （不預設印到哪個 stream，測試合併 stdout+stderr 判定）
+
+REQ 編號的作用域：本檔的 REQ-n 是「掃描範圍改三層 config 合併」那次交付（commit ebad63a）的需求編號。
+本 repo 的 REQ 編號**逐檔案局部有效** —— 不同測試檔的 REQ-1 指涉
+完全不同的需求，不要跨檔對照。原始需求文件住在交付當下的 castpower
+工作目錄（`.castpower/`，被 gitignore 完全排除、不進版控），所以這裡
+指的是 **commit**：`git show ebad63a` 永遠查得到，路徑不會。
 """
 import contextlib
 import io

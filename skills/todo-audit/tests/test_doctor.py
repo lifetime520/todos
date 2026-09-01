@@ -14,6 +14,12 @@ G-4（search_dirs 來源層級直接消費 load_scan_config() 的 provenance，
 依賴：`todo_config.load_scan_config()`（Task 1，尚未存在）。本檔預期在
 Task 1 落地前是 RED —— `doctor` 子指令連 argparse 都還沒註冊，所以
 第一層 RED 甚至到不了「import 不到 todo_config」那一步。
+
+REQ 編號的作用域：本檔的 REQ-n 是「新增 todo_cli.py doctor」那次交付（commit 528c175）的需求編號。
+本 repo 的 REQ 編號**逐檔案局部有效** —— 不同測試檔的 REQ-1 指涉
+完全不同的需求，不要跨檔對照。原始需求文件住在交付當下的 castpower
+工作目錄（`.castpower/`，被 gitignore 完全排除、不進版控），所以這裡
+指的是 **commit**：`git show 528c175` 永遠查得到，路徑不會。
 """
 import re
 import subprocess

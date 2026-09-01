@@ -1,3 +1,9 @@
+"""REQ 編號的作用域：本檔的 REQ-n 是「新增依賴圖純函式模組 todo_deps」那次交付（commit 078fd3f）的需求編號。
+本 repo 的 REQ 編號**逐檔案局部有效** —— 不同測試檔的 REQ-1 指涉
+完全不同的需求，不要跨檔對照。原始需求文件住在交付當下的 castpower
+工作目錄（`.castpower/`，被 gitignore 完全排除、不進版控），所以這裡
+指的是 **commit**：`git show 078fd3f` 永遠查得到，路徑不會。
+"""
 import sys
 import unittest
 from pathlib import Path

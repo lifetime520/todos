@@ -17,6 +17,12 @@
 **刻意不執行 `todo_cli.py audit`**——那會寫入正式待辦 DB
 （`~/.claude/todos/.audit/*.sqlite`），本 task 全域禁止。REQ-5 的驗證改用
 純記憶體呼叫 `collect_source_files(repo_root, config=<載入的設定>)`。
+
+REQ 編號的作用域：本檔的 REQ-n 是「加 per-repo 稽核設定並讓它進版控」那次交付（commit 7b28388）的需求編號。
+本 repo 的 REQ 編號**逐檔案局部有效** —— 不同測試檔的 REQ-1 指涉
+完全不同的需求，不要跨檔對照。原始需求文件住在交付當下的 castpower
+工作目錄（`.castpower/`，被 gitignore 完全排除、不進版控），所以這裡
+指的是 **commit**：`git show 7b28388` 永遠查得到，路徑不會。
 """
 import json
 import subprocess

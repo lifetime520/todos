@@ -14,6 +14,12 @@
 真的 `.md` 格式備份，測試會靜默改測別的內容——本 REQ 要補的分支覆蓋在該機器
 上會失效，測試卻仍然全綠。這正是同批交付另一個 task（REQ-1）要根治的
 「恆真偽裝」形狀，不可在這裡重蹈覆轍。
+
+REQ 編號的作用域：本檔的 REQ-n 是待辦 T-006 第 2 條那次交付（commit ac5ab3b）的需求編號。
+本 repo 的 REQ 編號**逐檔案局部有效** —— 不同測試檔的 REQ-1 指涉
+完全不同的需求，不要跨檔對照。原始需求文件住在交付當下的 castpower
+工作目錄（`.castpower/`，被 gitignore 完全排除、不進版控），所以這裡
+指的是 **commit**：`git show ac5ab3b` 永遠查得到，路徑不會。
 """
 import sys
 import unittest
