@@ -20,9 +20,9 @@
 
 ## 🔴 立即處理（P0 / 資金安全）（1）
 
-- [ ] [2026-08-01] 風控閾值檢查缺漏
-  > 🔗  ⚓ RiskEngine(42)
-  > 🏷️  risk, urgent
+- [ ] [2026-08-01] 合成範例：某個閾值檢查缺漏
+  > 🔗  ⚓ SynthPlaceholderWidget(42)
+  > 🏷️  synthetic, urgent
   > ⚠️  此條目在 heading 明確為 urgent 的段落下
 
 ## 🟠 待拍板決策（1）
