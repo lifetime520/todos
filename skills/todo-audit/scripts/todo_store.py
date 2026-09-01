@@ -146,14 +146,39 @@ def line_marker(raw):
     return tok if tok in MARKERS else None
 
 
-# md 章節標頭 → section。標頭裡的顏色 emoji 是穩定的分類訊號。
-_HEADING_SECTION = (
-    ('🔴', 'urgent'),
-    ('🟠', 'decision'),
-    ('🟡', 'normal'),
-    ('⚪', 'later'),
-    ('🟢', 'later'),
+# 章節分類的**單一定義來源**。新增或調整一種 section 只改這裡。
+#
+# 每列是 (section, canonical 標頭整行, 可辨識的符號…)：
+#   - canonical 標頭整行 → set_section() 人工搬章節時寫進 todo.heading
+#   - 可辨識的符號       → _section_of() 從既有 md 標頭反推 section
+#
+# 兩個方向刻意放在同一列，因為它們必須成對維護。過去這是兩張獨立的表
+# （_HEADING_SECTION 與 _SECTION_HEADING），新增一種 section 要記得改
+# 兩處，漏一處不會有任何測試變紅 —— 分類會靜默地只在單一方向生效。
+#
+# ⚠️ 這兩個方向**不是互為反函數**：later 有兩個可辨識符號（⚪ 與 🟢，
+# 歷史上兩種寫法都用過），但只有一個 canonical 輸出。所以這裡是
+# section → (一個輸出, 多個輸入) 的多對一結構，不能用「反轉字典」實作。
+#
+# ⚠️ 順序有意義：_section_of() 取第一個在標頭裡出現的符號，所以這個
+# tuple 的排列順序就是判定優先序。
+_SECTIONS = (
+    # section,    canonical 標頭整行,   可辨識的符號
+    ('urgent',   '## 🔴 緊急',        ('🔴',)),
+    ('decision', '## 🟠 待拍板決策',   ('🟠',)),
+    ('normal',   '## 🟡 一般',        ('🟡',)),
+    ('later',    '## ⚪ 之後再看',     ('⚪', '🟢')),
 )
+
+# 以下兩張查表**衍生自** _SECTIONS，不得手動維護。
+# md 章節標頭 → section。標頭裡的顏色 emoji 是穩定的分類訊號。
+_HEADING_SECTION = tuple(
+    (sym, section)
+    for section, _heading, syms in _SECTIONS
+    for sym in syms
+)
+# section → canonical 標頭整行（供 set_section() 使用）。
+_SECTION_HEADING = {section: heading for section, heading, _syms in _SECTIONS}
 
 
 def _section_of(title, heading=None):
@@ -723,7 +748,8 @@ def edit_title(con, key, new_title):
     return new_key
 
 
-_SECTION_HEADING = {'urgent': '## 🔴 緊急', 'decision': '## 🟠 待拍板決策', 'normal': '## 🟡 一般', 'later': '## ⚪ 之後再看'}
+# _SECTION_HEADING 定義在檔案上方的 _SECTIONS 區塊（與 _HEADING_SECTION
+# 一起從同一個來源衍生）—— 這裡刻意不再重複定義。
 
 
 def set_section(con, key, section):

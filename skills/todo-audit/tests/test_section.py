@@ -287,5 +287,66 @@ class TestSetSectionKeepsSectionColumnQueryable(unittest.TestCase):
         self.assertNotIn(self.key, self._keys_in_section('urgent'))
 
 
+class TestSectionTablesShareOneSource(unittest.TestCase):
+    """兩個方向的查表必須衍生自同一份 _SECTIONS 定義。
+
+    過去 `_HEADING_SECTION`（符號→section）與 `_SECTION_HEADING`
+    （section→標頭整行）是兩張獨立維護的表，新增一種 section 要記得改兩處。
+    漏改一處**不會有任何測試變紅** —— 該分類會靜默地只在單一方向生效
+    （例如 set_section() 搬得進去，但 _section_of() 認不出來）。
+
+    這裡斷言的是「兩張表確實由同一個來源導出」這個結構性質，而不是
+    比對兩份寫死的清單 —— 後者只會變成第三個要同步維護的地方。
+    """
+
+    def test_every_section_has_canonical_heading(self):
+        """_SECTIONS 的每一列都要能導出 canonical 標頭。"""
+        for section, heading, _syms in todo_store._SECTIONS:
+            self.assertEqual(todo_store._SECTION_HEADING[section], heading)
+
+    def test_section_heading_has_no_extra_entries(self):
+        """反向：_SECTION_HEADING 不得有 _SECTIONS 以外的鍵。
+
+        這條擋的是「有人繞過 _SECTIONS 直接往字典塞一筆」。
+        """
+        self.assertEqual(
+            set(todo_store._SECTION_HEADING),
+            {section for section, _h, _s in todo_store._SECTIONS})
+
+    def test_every_symbol_maps_back_to_its_section(self):
+        """每個可辨識符號都要能經 _HEADING_SECTION 回到原本的 section。"""
+        for section, _heading, syms in todo_store._SECTIONS:
+            for sym in syms:
+                self.assertIn((sym, section), todo_store._HEADING_SECTION)
+
+    def test_heading_section_has_no_extra_entries(self):
+        expected = {(sym, section)
+                    for section, _h, syms in todo_store._SECTIONS
+                    for sym in syms}
+        self.assertEqual(set(todo_store._HEADING_SECTION), expected)
+
+    def test_canonical_heading_resolves_back_to_its_own_section(self):
+        """端到端閉環：canonical 標頭餵回 _section_of() 要回到原 section。
+
+        這是本類別最重要的一條 —— 它同時看住兩張表，任一邊漏改都會紅。
+        標題刻意用會觸發**別的**分支的標記（[P0]→urgent），確保回傳值
+        來自 heading 判定而不是標題 fallback。
+        """
+        for section, heading, _syms in todo_store._SECTIONS:
+            with self.subTest(section=section):
+                self.assertEqual(
+                    todo_store._section_of('[P0] 標題殘留別的標記', heading),
+                    section)
+
+    def test_later_accepts_both_historical_symbols(self):
+        """⚪ 與 🟢 都要塌成 later —— 這是多對一，不能用反轉字典實作。
+
+        沒有這條的話，「把 _SECTIONS 改成 section→單一符號」這種看似
+        更簡潔的重構會靜默地讓 🟢 失去分類能力。
+        """
+        self.assertEqual(todo_store._section_of('x', '## ⚪ 之後再看'), 'later')
+        self.assertEqual(todo_store._section_of('x', '## 🟢 未來規劃'), 'later')
+
+
 if __name__ == '__main__':
     unittest.main()
