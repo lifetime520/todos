@@ -32,18 +32,57 @@ sys.path.insert(0, str(SCRIPTS))
 import todo_audit  # noqa: E402
 import todo_config  # noqa: E402
 
-# 從測試檔位置往上推：tests/ -> todo-audit/ -> skills/ -> repo root。
-# 不硬編絕對路徑，也不用 os.getcwd()（跑測試時 cwd 是 skills/todo-audit，
-# 不是 repo root）。
-REPO_ROOT = Path(__file__).resolve().parents[3]
-CONFIG_PATH = REPO_ROOT / '.claude' / 'todo-audit.json'
+def _find_repo_root(start):
+    """從測試檔往上找 repo root —— 認的是 `.git`，不是層數。
+
+    原本寫死 `parents[3]`（tests/ → todo-audit/ → skills/ → repo root），
+    等於把 repo 佈局編進測試。任何一層目錄被搬動或多包一層，這個常數就
+    指到別的地方去，而失敗訊息會是「設定檔不存在」——指向錯的結論。
+
+    改認 `.git` 的理由：它是 repo root 的定義本身，不是佈局的巧合。
+    `Path(__file__).resolve()` 會解開 symlink，所以從
+    `~/.claude/skills/todo-audit`（指回本 repo 的 symlink）跑測試時，
+    起點仍落在真正的 checkout 裡，往上找得到 `.git`。
+
+    找不到時**回傳 None 而不是猜一個路徑**——由呼叫端決定怎麼報，
+    見 `RepoAuditConfigFixture._require_repo_root()`。猜一個路徑會讓
+    後續斷言以「設定檔不存在」的形式失敗，把「這裡不是 repo checkout」
+    這個真正的原因藏起來。
+    """
+    for candidate in [start, *start.parents]:
+        if (candidate / '.git').exists():
+            return candidate
+    return None
+
+
+REPO_ROOT = _find_repo_root(Path(__file__).resolve().parent)
+CONFIG_PATH = (REPO_ROOT / '.claude' / 'todo-audit.json') if REPO_ROOT else None
 
 
 class RepoAuditConfigFixture(unittest.TestCase):
+    def _require_repo_root(self):
+        """先確認我們真的在一個 repo checkout 裡。
+
+        這個守衛必須排在 `_require_config_path()` 之前：找不到 repo root
+        時 `CONFIG_PATH` 是 None，後續斷言會以「設定檔不存在」的形式失敗，
+        而真正的原因是「這份測試被從 repo 外的位置跑起來」——兩者的正確
+        反應完全不同（前者要去建設定檔，後者要換個地方跑）。
+
+        刻意用 fail 而不是 skipTest：靜默跳過會讓整份保護在部署位置上
+        無聲失效，而測試報告仍然是綠的。
+        """
+        if REPO_ROOT is None:
+            self.fail(
+                f'從 {Path(__file__).resolve().parent} 往上找不到含 .git 的目錄'
+                ' —— 這份測試驗的是 repo 根目錄的 .claude/todo-audit.json，'
+                '必須在 repo checkout 裡執行。若你是從複製（而非 symlink）到'
+                ' ~/.claude/skills/todo-audit 的部署位置跑的，請改到 repo 內執行。')
+
     def _require_config_path(self):
         """存在性檢查獨立成一個可重用斷言，讓每個測試方法失敗時的訊息
         都能直接點名「設定檔還不存在」，而不是被後續的 open()/json.loads()
         丟出的 FileNotFoundError 蓋過去。"""
+        self._require_repo_root()
         self.assertTrue(
             CONFIG_PATH.exists(),
             f'{CONFIG_PATH} 不存在 —— REQ-5 要求 repo 根目錄要有這份設定檔，'
@@ -261,6 +300,58 @@ class TestCollectSourceFilesWithRepoConfig(RepoAuditConfigFixture):
             '它是本 skill 最長的規格文件，待辦錨點指向它時目前驗不出來，'
             '而性質相同的 docs/ 底下文件已經被涵蓋，兩者不該有不同待遇。',
         )
+
+    def test_skill_md_entry_widens_scope_by_exactly_one_file(self):
+        """加入 SKILL.md 那筆設定，掃描集合只能多這一個檔 —— 不多不少。
+
+        上面那條只驗「SKILL.md 有進集合」，驗不到「有沒有夾帶納入別的東西」。
+        兩者是不同的性質：把 search_dirs 裡的 `skills/todo-audit/scripts`
+        放寬成 `skills/todo-audit` 目錄，SKILL.md 一樣會進集合，上面那條
+        照樣綠 —— 但那是被明確排除的做法（範圍變動大於需求，且未來有人在
+        `skills/todo-audit/` 頂層新增檔案時會被無感納入）。
+
+        這裡比對「含該筆設定」與「不含」兩種 config 的回傳集合，斷言差集
+        **恰好**是 SKILL.md 一個檔。刻意不斷言集合大小的絕對數字——那會隨
+        任何無關的檔案增刪而誤紅，是「恆假斷言」，同樣是斷言對象選錯。
+        """
+        self._require_config_path()
+
+        empty_home = tempfile.TemporaryDirectory()
+        self.addCleanup(empty_home.cleanup)
+        defaults = {
+            'search_dirs': list(todo_audit.SEARCH_DIRS),
+            'scan_exts': list(todo_audit.SCAN_EXTS),
+        }
+        config, _prov, _warn = todo_config.load_config(
+            REPO_ROOT, defaults, home=Path(empty_home.name))
+
+        skill_md_entry = 'skills/todo-audit/SKILL.md'
+        self.assertIn(
+            skill_md_entry, config['search_dirs'],
+            f'search_dirs 應包含 {skill_md_entry}（REQ-3）')
+
+        # 只在記憶體裡拿掉那一筆，不動磁碟上的設定檔
+        without = dict(config)
+        without['search_dirs'] = [d for d in config['search_dirs']
+                                  if d != skill_md_entry]
+
+        with_files, _ = todo_audit.collect_source_files(REPO_ROOT, config=config)
+        without_files, _ = todo_audit.collect_source_files(REPO_ROOT, config=without)
+
+        added = set(with_files) - set(without_files)
+        removed = set(without_files) - set(with_files)
+        skill_md = REPO_ROOT / 'skills' / 'todo-audit' / 'SKILL.md'
+
+        self.assertEqual(
+            added, {skill_md},
+            f'加入 {skill_md_entry} 後多掃到的檔案應該恰好是 SKILL.md，'
+            f'實際多了 {sorted(str(p) for p in added)} —— 若這裡出現其他檔案，'
+            '代表 search_dirs 那一筆被改成了涵蓋範圍更大的路徑（例如放寬成'
+            ' skills/todo-audit 目錄），那是 REQ-3 明確排除的做法。')
+        self.assertFalse(
+            removed,
+            f'加入一筆 search_dirs 不該讓任何檔案消失，卻少了 '
+            f'{sorted(str(p) for p in removed)}')
 
 
 class TestConfigFileIsNotGitignored(RepoAuditConfigFixture):
