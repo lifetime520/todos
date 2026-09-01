@@ -146,6 +146,65 @@ class TestKeyCollision(unittest.TestCase):
         self.assertEqual(todo_store.render(todo_store.parse_md_lossless('')), '')
 
 
+class TestSaveParsedRejectsKeyCollision(unittest.TestCase):
+    """save_parsed() 遇到同一批重複 key 必須報錯，且一列都不寫。
+
+    上面的 TestKeyCollision 驗的是 parse/render 這一層 —— 它用 sort_order
+    索引 layout，兩條都活著。缺口在 save_parsed()：key = sha1(date|title)，
+    todo.key 又是 PRIMARY KEY，所以第二條會 UPDATE 掉第一條，DB 只剩一列。
+    md 檔看起來完好無損，DB 卻少了一條，沒有任何錯誤訊息 —— 靜默資料遺失。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.con = todo_store.connect(Path(self.tmp.name) / 't.sqlite')
+
+    def tearDown(self):
+        self.con.close()
+        self.tmp.cleanup()
+
+    _DUP = ("- [ ] [2026-08-08] 同名\n  > 💡  A\n\n"
+            "- [ ] [2026-08-08] 同名\n  > 💡  B\n")
+
+    def test_raises_on_duplicate_key_in_same_batch(self):
+        parsed = todo_store.parse_md_lossless(self._DUP)
+        # 前提：解析層本來就給出兩條（否則這個測試驗的是別的東西）
+        self.assertEqual(len(parsed['items']), 2)
+        with self.assertRaises(ValueError) as ctx:
+            todo_store.save_parsed(self.con, 'demo', parsed)
+        # 訊息要讓人當場知道是哪兩條撞了，不能只說「出錯了」
+        self.assertIn('同名', str(ctx.exception))
+
+    def test_writes_nothing_when_collision_detected(self):
+        """報錯前不得留下半套資料 —— 碰撞偵測必須在任何 INSERT 之前。
+
+        這條是本類別真正的重點：只 raise 但已經寫進去一列的話，DB 會處在
+        一個「md 有兩條、DB 有一條」的狀態，而使用者看到的是例外訊息、
+        以為什麼都沒發生。
+        """
+        parsed = todo_store.parse_md_lossless(self._DUP)
+        with self.assertRaises(ValueError):
+            todo_store.save_parsed(self.con, 'demo', parsed)
+        n = self.con.execute('SELECT COUNT(*) FROM todo').fetchone()[0]
+        self.assertEqual(n, 0, f'碰撞被擋下後 todo 表應該是空的，實際有 {n} 列')
+
+    def test_normal_batch_still_writes(self):
+        """守衛不得誤傷正常批次（否則這個保護是恆假的）。"""
+        ok = ("- [ ] [2026-08-08] 甲\n  > 💡  A\n\n"
+              "- [ ] [2026-08-08] 乙\n  > 💡  B\n")
+        todo_store.save_parsed(self.con, 'demo', todo_store.parse_md_lossless(ok))
+        n = self.con.execute('SELECT COUNT(*) FROM todo').fetchone()[0]
+        self.assertEqual(n, 2)
+
+    def test_same_title_different_date_is_not_a_collision(self):
+        """key 是 sha1(date|title) —— 日期不同就不該被擋。"""
+        ok = ("- [ ] [2026-08-08] 同名\n  > 💡  A\n\n"
+              "- [ ] [2026-08-09] 同名\n  > 💡  B\n")
+        todo_store.save_parsed(self.con, 'demo', todo_store.parse_md_lossless(ok))
+        n = self.con.execute('SELECT COUNT(*) FROM todo').fetchone()[0]
+        self.assertEqual(n, 2)
+
+
 class TestPersistence(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

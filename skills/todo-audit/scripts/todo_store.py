@@ -286,7 +286,39 @@ def to_audit_shape(parsed):
 # ---------------------------------------------------------------- 持久化
 
 def save_parsed(con, project, parsed):
-    """寫入條目與版面。既有 status 不被覆蓋 —— 遷移可重跑。"""
+    """寫入條目與版面。既有 status 不被覆蓋 —— 遷移可重跑。
+
+    同一批出現重複 key 會直接 raise，不寫入任何一列。key 是
+    sha1(date|title)，所以「同日同標題」的兩條就是同一個 key —— 而
+    todo.key 是 PRIMARY KEY，第二條只會 UPDATE 掉第一條，DB 只剩一列。
+    parse_md_lossless()/render() 用 sort_order 索引 layout，兩條都活著
+    （見 test_store.py 的 TestKeyCollision），所以損失只發生在 md→DB
+    這一段，md 檔看起來完好無損，DB 卻少了一條 —— 沒有錯誤訊息、沒人
+    會發現。
+
+    這裡選擇報錯而不是「納入 sort_order 當主鍵」或「容忍重複」，是因為
+    後兩者都要動 todo.key 的 PRIMARY KEY 約束，而 anchor/probe/verdict/
+    todo_line/todo_dep/todo_event 六張表都拿 todo_key 當外鍵或主鍵成分，
+    且「用 key 唯一定位一條」是 show/note/mark/flag 全部指令的前提。
+    為一條一次性遷移路徑付這個代價不划算。
+
+    這也與本 repo 既有的取捨一致：`init` 之外的指令找不到 DB 一律 exit 2
+    並指路，不自作主張建空庫 —— 靜默的錯誤狀態比大聲失敗糟得多。
+    """
+    seen = {}
+    for it in parsed['items']:
+        if it['key'] in seen:
+            raise ValueError(
+                f'同一批寫入出現重複的 todo key：{it["key"]}\n'
+                f'  第 1 筆：[{seen[it["key"]]["date"]}] '
+                f'{seen[it["key"]]["title"]}\n'
+                f'  第 2 筆：[{it["date"]}] {it["title"]}\n'
+                'key = sha1(date|title)，故同日同標題必然碰撞。todo.key 是 '
+                'PRIMARY KEY，硬寫下去第二筆會覆蓋第一筆、DB 只剩一列，而 md '
+                '檔看起來完好 —— 這是靜默的資料遺失，所以這裡直接中止，'
+                '一列都不寫。修法：把其中一條的標題或日期改成不同的值。')
+        seen[it['key']] = it
+
     cur = con.cursor()
     for it in parsed['items']:
         prev = cur.execute('SELECT status FROM todo WHERE key=?',
