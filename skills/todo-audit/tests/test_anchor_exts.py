@@ -9,11 +9,17 @@
   todos       有檔案錨點的條目 0→6，新增 6 個錨點，其中 1 個查無此檔
   tradingbot  有檔案錨點的條目 98→125，新增 56 個錨點，**其中 21 個查無此檔**
 tradingbot 那 21 個是 `~/.claude/…` 底下的檔案、以及 analysis.md／bindings.md 這類
-跑完就刪的 workspace 產物。而檔案錨點**沒有**符號那條「從未存在於 git 歷史 →
+跑完就刪的 workspace 產物。而檔案錨點當時**沒有**符號那條「從未存在於 git 歷史 →
 不算 GONE 訊號」的過濾（verify() 對 file 是 `OK if hits else GONE`），
 所以那 21 個會直接變成假 GONE——正是本工具最怕的「把仍成立的待辦標成可移除」。
 
 因此做成 opt-in：預設清單一字不改，需要的 repo 自己在 .claude/todo-audit.json 開。
+
+**後續（該缺口已補，見 tests/test_file_never_existed.py）**：檔案錨點現在有同款
+過濾了。補完後量到的事實比上面這段描述更廣——tradingbot **在沒開 md 的預設清單下**
+就有 46 個查無此檔的錨點，其中 43 個從未進過版控。也就是說假 GONE 一直存在於預設
+設定裡，md 只是讓它更明顯，不是成因。本檔的 opt-in 結論不變（預設值要不要動是另一
+個問題，需要另外拿證據），但「加 md 會製造假 GONE」這個當初的否決理由已經不成立。
 
 本檔釘住四件事：
   1. 不設 anchor_exts 時，行為與改動前完全相同（md 不是錨點）

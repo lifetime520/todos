@@ -28,11 +28,18 @@ import todo_config
 # 為什麼要做成可設定，而不是直接把 md 加進預設值：這份清單決定「todo 文字裡什麼
 # 字串算是檔案錨點」，那取決於該專案的產物是什麼。純文件 repo（skill／規格庫）的
 # 主體是 markdown，`SKILL.md:284` 這種引用在預設清單下抽不出任何錨點，稽核對它
-# 幾乎失效（實測 cast-power 3 條待辦全部落在 NO_ANCHOR）。但**全域加 md 不安全**：
+# 幾乎失效（實測 cast-power 3 條待辦全部落在 NO_ANCHOR）。當時全域加 md 不安全：
 # 實測 tradingbot 的 233 條待辦會多出 21 個查無此檔的錨點——`~/.claude/…` 底下的
-# 檔案，以及 analysis.md／bindings.md 這類跑完就刪的 workspace 產物。而檔案錨點
-# **沒有**符號那條「從未存在於 git 歷史 → 不算 GONE 訊號」的過濾（見 verify()），
-# 所以那 21 個會直接變成假 GONE，正是本工具最怕的「把仍成立的待辦標成可移除」。
+# 檔案，以及 analysis.md／bindings.md 這類跑完就刪的 workspace 產物，而檔案錨點
+# 當時**沒有**符號那條「從未存在於 git 歷史 → 不算 GONE 訊號」的過濾，
+# 那 21 個會直接變成假 GONE。
+#
+# **該缺口已補**（見 files_never_existed()）。補完後量到的事實比上面的描述更廣：
+# tradingbot **在沒開 md 的預設清單下**就有 46 個查無此檔的錨點，其中 **43 個**
+# 從未進過版控——換句話說這個假 GONE 一直存在於預設設定，md 只是讓它更明顯，
+# 不是它的成因。這份清單要不要加 md 因此重新變成一個純粹的「什麼算錨點」問題，
+# 不再背著「加了就會產生假 GONE」的副作用；但預設值仍不動，改變預設會動到所有
+# repo 的判定，那要另外拿證據。
 #
 # 兩條 regex 共用同一份清單。它們原本各有一份且**不一致**（RE_FILE_LINE 少了 `js`）；
 # 統一後等於補上 js，實測對 cast-power／todos／tradingbot 三個 repo 的 file_line
