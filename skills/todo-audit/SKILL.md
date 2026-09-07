@@ -157,7 +157,7 @@ DB 在 `~/.claude/todos/.audit/{project}.sqlite` —— 天然按專案隔離，
 但**全域加 `md` 不安全**：實測 tradingbot 的 233 條待辦會多出 **21 個查無此檔的錨點**
 （`~/.claude/…` 底下的檔、以及 `analysis.md`／`bindings.md` 這類跑完就刪的 workspace 產物）。
 關鍵在下面這條不對稱——檔案錨點**沒有**符號那條「從未存在於 git 歷史 → 不算 GONE 訊號」的過濾
-（`build_checks()` 對 file 是 `OK if hits else GONE`），所以那 21 個會直接變成假 GONE。
+（`verify()` 對 file 是 `OK if hits else GONE`，符號則另有 `never` 那一支），所以那 21 個會直接變成假 GONE。
 → 改成 per-repo 可設定的 `anchor_exts`（預設清單一字未改），需要的 repo 自己在
 `.claude/todo-audit.json` 開。**opt-in 的理由不是保守，是量出來的**：同一個改動在 A repo 是修復、在 B repo 是 21 個假 GONE。
 

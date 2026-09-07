@@ -31,7 +31,7 @@ import todo_config
 # 幾乎失效（實測 cast-power 3 條待辦全部落在 NO_ANCHOR）。但**全域加 md 不安全**：
 # 實測 tradingbot 的 233 條待辦會多出 21 個查無此檔的錨點——`~/.claude/…` 底下的
 # 檔案，以及 analysis.md／bindings.md 這類跑完就刪的 workspace 產物。而檔案錨點
-# **沒有**符號那條「從未存在於 git 歷史 → 不算 GONE 訊號」的過濾（見 build_checks()），
+# **沒有**符號那條「從未存在於 git 歷史 → 不算 GONE 訊號」的過濾（見 verify()），
 # 所以那 21 個會直接變成假 GONE，正是本工具最怕的「把仍成立的待辦標成可移除」。
 #
 # 兩條 regex 共用同一份清單。它們原本各有一份且**不一致**（RE_FILE_LINE 少了 `js`）；

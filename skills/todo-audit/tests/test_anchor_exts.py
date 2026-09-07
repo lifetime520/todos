@@ -10,7 +10,7 @@
   tradingbot  有檔案錨點的條目 98→125，新增 56 個錨點，**其中 21 個查無此檔**
 tradingbot 那 21 個是 `~/.claude/…` 底下的檔案、以及 analysis.md／bindings.md 這類
 跑完就刪的 workspace 產物。而檔案錨點**沒有**符號那條「從未存在於 git 歷史 →
-不算 GONE 訊號」的過濾（build_checks() 對 file 是 `OK if hits else GONE`），
+不算 GONE 訊號」的過濾（verify() 對 file 是 `OK if hits else GONE`），
 所以那 21 個會直接變成假 GONE——正是本工具最怕的「把仍成立的待辦標成可移除」。
 
 因此做成 opt-in：預設清單一字不改，需要的 repo 自己在 .claude/todo-audit.json 開。
@@ -202,6 +202,53 @@ class TestAnchorDefinitionIsGlobal(unittest.TestCase):
         todo_audit.set_anchor_exts(list(todo_audit.ANCHOR_EXTS) + ['md'])
         todo_audit.set_anchor_exts(todo_audit.ANCHOR_EXTS)
         self.assertIsNone(todo_audit.RE_FILE.search('SKILL.md'))
+
+
+class TestCommentsDontNameMissingFunctions(unittest.TestCase):
+    """註解裡點名的 `foo()` 必須真的存在於 todo_audit.py。
+
+    這條擋的是**指向不存在東西的引用**。本 repo 反覆栽在同一類問題上：
+    指向被 gitignore 的 `.castpower/` 路徑、指向被插入行數推移後的舊行號、
+    引用從未進 git 歷史的中間版本 —— 以及這次的 `build_checks()`，一個
+    在三份檔案裡被提到、卻從來不存在的函式名（真正的邏輯在 `verify()`）。
+    共同形狀是「讀者循著線索去找，找不到」。
+
+    判準刻意不用白名單：一個名字只要在**程式碼**裡被定義或被呼叫過，就算
+    存在（`len()` 這類內建因此自動放行，不需要人工維護清單）。只有「註解
+    提到、但程式碼從未出現」的名字才會被標出來 —— 那正是幽靈引用的形狀。
+    """
+
+    _SCRIPTS = Path(__file__).resolve().parent.parent / 'scripts'
+    _SRC = _SCRIPTS / 'todo_audit.py'
+    # 註解裡形如 `foo()` 的提及。要求**緊接空的括號對**，因為註解在指稱一個
+    # 函式時寫的是 `verify()`；帶參數的 `refactor(test)` 是在描述 commit
+    # message 的形狀，不是函式引用。
+    _MENTION = re.compile(r'\b([a-z_][a-z0-9_]{2,})\(\)')
+    # 程式碼裡的定義與呼叫（此處允許帶參數）。
+    _DEFINED_OR_CALLED = re.compile(r'\b([a-z_][a-z0-9_]{2,})\(')
+
+    def test_no_phantom_function_references_in_comments(self):
+        lines = self._SRC.read_text(encoding='utf-8').split('\n')
+        comment, code = [], []
+        for line in lines:
+            (comment if line.lstrip().startswith('#') else code).append(line)
+
+        mentioned = set(self._MENTION.findall('\n'.join(comment)))
+        existing = set(self._DEFINED_OR_CALLED.findall('\n'.join(code)))
+        # 跨模組引用是合法的：註解說「見 append_item()」而它定義在
+        # todo_store.py，讀者找得到，不是幽靈。
+        for sibling in sorted(self._SCRIPTS.glob('*.py')):
+            existing |= set(re.findall(
+                r'^def ([a-z_][a-z0-9_]*)\(',
+                sibling.read_text(encoding='utf-8'), re.M))
+        phantom = sorted(mentioned - existing)
+
+        self.assertFalse(
+            phantom,
+            f'todo_audit.py 的註解點名了這些在程式碼裡從未出現的函式：{phantom}\n'
+            '讀者循著這個名字去找會找不到。請改成正確的名字，或改寫成不指名'
+            '函式的描述。（本測試的起因：三份檔案都寫 build_checks()，'
+            '而實際做這件事的是 verify()）')
 
 
 if __name__ == '__main__':
