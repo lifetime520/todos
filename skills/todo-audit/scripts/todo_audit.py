@@ -148,6 +148,12 @@ CREATE TABLE IF NOT EXISTS verdict(
 CREATE TABLE IF NOT EXISTS symbol_history(
   symbol TEXT PRIMARY KEY, never_existed INT, checked_at TEXT);
 
+-- 檔案版的同一件事（見 files_never_existed()）。刻意**不與 symbol_history 共用**：
+-- 符號查內容（git log -S），檔案查路徑（git log -- pathspec），語意不同，
+-- 一個剛好同名的檔案與符號會在單一鍵空間下互相污染判定。
+CREATE TABLE IF NOT EXISTS file_history(
+  path TEXT PRIMARY KEY, never_existed INT, checked_at TEXT);
+
 CREATE INDEX IF NOT EXISTS ix_probe_state ON probe(state);
 """
 
@@ -522,6 +528,40 @@ def collect_touches(anchors, touch_index, sym_index, since_date):
     return touches
 
 
+def _never_existed(repo, keys, db_path, table, key_col, git_args, label):
+    """「從未存在於 git 歷史」的共用判定 ＋ 永久快取。
+
+    符號與檔案的判定語意相同（單調事實，見 SCHEMA 註解），只差查法：
+    符號查內容（-S），檔案查路徑（-- pathspec）。table／key_col 是內部常數，
+    不是外部輸入，故可直接拼進 SQL。
+    """
+    out, cached, con = set(), {}, None
+    if db_path:
+        con = sqlite3.connect(db_path)
+        con.executescript(SCHEMA)
+        cached = dict(con.execute(f'SELECT {key_col}, never_existed FROM {table}'))
+    todo_keys = [k for k in keys if k not in cached]
+    out |= {k for k in keys if cached.get(k) == 1}
+    for k in todo_keys:
+        try:
+            r = subprocess.run(['git', 'log', '--all', '--oneline', '-1', *git_args(k)],
+                               cwd=repo, capture_output=True, text=True, timeout=30)
+            never = 1 if not r.stdout.strip() else 0
+        except Exception:
+            never = 0     # 查不到就當它存在——保守，不製造假的「從未存在」
+        if never:
+            out.add(k)
+        if con:
+            con.execute(f'INSERT OR REPLACE INTO {table} VALUES(?,?,?)',
+                        (k, never, _now()))
+    if con:
+        con.commit(); con.close()
+    if todo_keys:
+        print(f'  （git 全歷史查詢 {len(todo_keys)} 個新{label}，'
+              f'{len(keys)-len(todo_keys)} 個命中快取）')
+    return out
+
+
 def never_existed(repo, symbols, db_path=None):
     """用 git pickaxe 全歷史判斷：哪些符號**從未存在**於這個 repo。
 
@@ -533,41 +573,49 @@ def never_existed(repo, symbols, db_path=None):
 
     只對已判定 GONE 的符號查，數量少，成本可控。
     """
-    out, cached, con = set(), {}, None
-    if db_path:
-        con = sqlite3.connect(db_path)
-        con.executescript(SCHEMA)
-        cached = dict(con.execute('SELECT symbol, never_existed FROM symbol_history'))
-    todo_syms = [s for s in symbols if s not in cached]
-    out |= {s for s in symbols if cached.get(s) == 1}
-    for s in todo_syms:
-        try:
-            r = subprocess.run(['git', 'log', '--all', '--oneline', '-S', s, '-1'],
-                               cwd=repo, capture_output=True, text=True, timeout=30)
-            never = 1 if not r.stdout.strip() else 0
-        except Exception:
-            never = 0     # 查不到就當它存在——保守，不製造假的「從未存在」
-        if never:
-            out.add(s)
-        if con:
-            con.execute('INSERT OR REPLACE INTO symbol_history VALUES(?,?,?)',
-                        (s, never, _now()))
-    if con:
-        con.commit(); con.close()
-    if todo_syms:
-        print(f'  （git 全歷史查詢 {len(todo_syms)} 個新符號，'
-              f'{len(symbols)-len(todo_syms)} 個命中快取）')
-    return out
+    return _never_existed(repo, symbols, db_path, 'symbol_history', 'symbol',
+                          lambda s: ['-S', s], '符號')
 
 
-def verify(todo, anchors, repo, sym_index, by_name, commit_set, never=frozenset()):
-    """對照現況，產生 anchor 級的驗證結果。"""
+def files_never_existed(repo, files, db_path=None):
+    """檔案版：哪些檔名**從未存在**於這個 repo 的 git 歷史。
+
+    檔案錨點原本沒有這層過濾（`'OK' if hits else 'GONE'`），於是兩類零訊號的
+    字串被當成「載體消失」：
+
+      glob 樣板    collab-stage*-round-*-notes.md 被 RE_FILE 截成 notes.md
+      repo 外產物  analysis.md／bindings.md 這類跑完就刪的 workspace 檔，
+                   以及 `~/.claude/…` 底下的檔案
+
+    兩者都從未進過版控，判 GONE 等於把仍成立的待辦標成可移除。這個不對稱
+    正是 anchor_exts 只能做成 opt-in 的原因（見 tests/test_anchor_exts.py 檔頭）。
+
+    以 basename 為鍵：RE_FILE 抓的本來就是裸檔名，而 file:line 錨點的路徑由
+    待辦作者手寫、未必等於 repo 內真實路徑（by_name 索引同樣以 basename 為鍵）。
+    pathspec 兩式並列，涵蓋 repo 根目錄與任意子目錄。
+    """
+    return _never_existed(repo, files, db_path, 'file_history', 'path',
+                          lambda f: ['--', f, f'*/{f}'], '檔名')
+
+
+def verify(todo, anchors, repo, sym_index, by_name, commit_set, never=frozenset(),
+           never_files=frozenset()):
+    """對照現況，產生 anchor 級的驗證結果。
+
+    `never` / `never_files`：從未存在於 git 歷史的符號／檔名。兩者都標成 OK，
+    但那不是說錨點成立，而是說它**不構成 GONE 訊號**（零訊號 ≠ 反證）。
+    """
     checks = []
 
     for f, ln in anchors['file_line']:
         hits = by_name.get(Path(f).name, [])
         if not hits:
-            checks.append({'kind': 'file_line', 'ref': f'{f}:{ln}', 'state': 'GONE'})
+            if Path(f).name in never_files:
+                checks.append({
+                    'kind': 'file_line', 'ref': f'{f}:{ln}', 'state': 'OK',
+                    'detail': '從未存在於 git 歷史（樣板或 repo 外路徑，非錨點）'})
+            else:
+                checks.append({'kind': 'file_line', 'ref': f'{f}:{ln}', 'state': 'GONE'})
         else:
             p = hits[0]
             total = sum(1 for _ in p.open(encoding='utf-8', errors='ignore'))
@@ -579,11 +627,14 @@ def verify(todo, anchors, repo, sym_index, by_name, commit_set, never=frozenset(
 
     for f in anchors['file']:
         hits = by_name.get(f, [])
-        checks.append({
-            'kind': 'file', 'ref': f,
-            'state': 'OK' if hits else 'GONE',
-            'detail': str(hits[0]) if hits else '',
-        })
+        if hits:
+            st, detail = 'OK', str(hits[0])
+        elif f in never_files:
+            # 與符號同款：從未存在 ≠ 消失。標 OK 是說它不構成 GONE 訊號
+            st, detail = 'OK', '從未存在於 git 歷史（樣板或 repo 外檔名，非錨點）'
+        else:
+            st, detail = 'GONE', ''
+        checks.append({'kind': 'file', 'ref': f, 'state': st, 'detail': detail})
 
     for s in anchors['symbol']:
         hits = sym_index.get(s, [])
@@ -1129,9 +1180,18 @@ def main():
         print(f'查無符號 {len(gone_syms)} 個，其中 {len(never)} 個從未存在於 git 歷史'
               f'（描述性稱呼，已排除為假 GONE 訊號）\n')
 
+    # 檔案錨點同理。兩種形式的比對鍵都是 basename（見 files_never_existed()）。
+    gone_files = {f for a in all_anchors for f in a['file'] if not by_name.get(f)}
+    gone_files |= {Path(f).name for a in all_anchors for f, _ in a['file_line']
+                   if not by_name.get(Path(f).name)}
+    never_files = files_never_existed(repo, gone_files, dbp)
+    if gone_files:
+        print(f'查無此檔 {len(gone_files)} 個，其中 {len(never_files)} 個從未存在於 git 歷史'
+              f'（樣板或 repo 外檔名，已排除為假 GONE 訊號）\n')
+
     results, tally = [], defaultdict(int)
     for t, a in zip(todos, all_anchors):
-        checks = verify(t, a, repo, sym_index, by_name, commit_set, never)
+        checks = verify(t, a, repo, sym_index, by_name, commit_set, never, never_files)
         touches = collect_touches(a, touch_index, sym_index, t['date'])
         state = classify(checks, touches)
         tally[state] += 1
