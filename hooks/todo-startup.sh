@@ -64,11 +64,13 @@ f = todo_store.freshness(con)
 lines = [f"[{project}] 待辦 {pending + doing} 項（P0 {p0} 項）"]
 if doing:
     owners = con.execute(
-        "SELECT short_id, status_by FROM todo WHERE status='doing'"
-        ' ORDER BY sort_order').fetchall()
-    who = ', '.join(f'{s}@{b or "?"}' for s, b in owners)
-    lines.append(f"進行中 {doing} 項：{who}"
-                 "（可能掛在別的 session，動工前先確認）")
+        "SELECT short_id, status_by, status_at FROM todo WHERE status='doing'"
+        ' ORDER BY status_at').fetchall()
+    who = ', '.join(f'{s}@{b or "?"}（{todo_store.humanize_age(a)}）'
+                    for s, b, a in owners[:5])
+    more = f' …共 {doing} 項' if doing > 5 else ''
+    lines.append(f"進行中 {doing} 項：{who}{more}"
+                 "（認領守衛會擋你動這些條目；接管走 session-ws --takeover）")
 
 if f['last_run'] is None:
     lines.append("⚠️ 從未稽核 —— 沒有任何新鮮度證據")
