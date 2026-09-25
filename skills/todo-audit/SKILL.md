@@ -1,6 +1,7 @@
 ---
 name: todo-audit
-description: Use when auditing a project todo list for stale entries, detecting duplicate/related todos, deciding which todos to merge or remove, or when any todo needs to be read, listed, added, or marked. The todo store is `~/.claude/todos/.audit/{project}.sqlite` and direct reads of `~/.claude/todos/` are blocked by a PreToolUse hook — all access goes through `scripts/todo_cli.py`, whose output carries audit freshness and a per-item state tag. Extracts machine-verifiable anchors (file:line, symbols, SQL tables, config keys, commits), cross-checks them against the live codebase and git history, and produces evidence-backed triage — it does not decide on its own. Keywords: 待辦稽核, 過期 todo, stale todo, todo 重複偵測, 列出待辦, anchor verification, pickaxe.
+description: >-
+  Use when auditing a project todo list for stale entries, detecting duplicate/related todos, deciding which todos to merge or remove, or when any todo needs to be read, listed, added, or marked. The todo store is `~/.claude/todos/.audit/{project}.sqlite` and direct reads of `~/.claude/todos/` are blocked by a PreToolUse hook — all access goes through `scripts/todo_cli.py`, whose output carries audit freshness and a per-item state tag. Extracts machine-verifiable anchors (file:line, symbols, SQL tables, config keys, commits), cross-checks them against the live codebase and git history, and produces evidence-backed triage — it does not decide on its own. Keywords: 待辦稽核, 過期 todo, stale todo, todo 重複偵測, 列出待辦, anchor verification, pickaxe.
 ---
 
 # todo-audit
