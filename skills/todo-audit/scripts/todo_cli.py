@@ -11,6 +11,7 @@ import json
 import os
 import sqlite3
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -252,6 +253,60 @@ def cmd_rm(con, args):
         print(f'{sid} 已永久刪除')
     todo_store.write_mirror(con, args.project_resolved,
                             mirror_path(args.project_resolved))
+
+
+PRUNE_MIN_DAYS = 30
+
+
+def cmd_prune(con, args):
+    """依年齡清除「未開工」的 pending —— 每週 cron 呼叫，不經 audit 證據。
+
+    判準刻意收窄到最沒爭議的一類：done/unpick 是歷史、doing 有人認領、
+    點過任何交付旗標（progress != 0）的 pending 已經開工，一律不動。
+    date='1970-01-01' 是標題解析不到日期時的預設值，代表「未知」而非
+    「最舊」—— 不排除的話，它們會是第一批被刪的。
+    """
+    if args.older_than_days < PRUNE_MIN_DAYS:
+        # 打錯一個數字（0、-60、6）就會一次清光所有 pending，且不留備份
+        print(f'--older-than-days 至少 {PRUNE_MIN_DAYS}（收到 '
+              f'{args.older_than_days}）', file=sys.stderr)
+        return 2
+    today = (date.fromisoformat(args.today) if args.today else date.today())
+    cutoff = (today - timedelta(days=args.older_than_days)).isoformat()
+    # 選取與刪除必須在同一個寫入 transaction 內：否則選完之後、刪之前，
+    # 別的 session 可以 mark doing / flag set，而 remove_item 只看 key，
+    # 會把剛被認領的條目抹掉，對方下一個指令只拿到「查無條目」。
+    # IMMEDIATE 讓對方的寫入在這段期間等鎖，一次 commit 也順帶消除
+    # 中途失敗留下半套狀態的可能。
+    con.execute('BEGIN IMMEDIATE')
+    try:
+        victims = con.execute(
+            "SELECT key, short_id, raw_title FROM todo"
+            " WHERE sort_order IS NOT NULL AND status='pending'"
+            " AND COALESCE(progress, 0)=0"
+            " AND date < ? AND date != '1970-01-01'"
+            " ORDER BY date", (cutoff,)).fetchall()
+        verb = '將刪除' if args.dry_run else '已刪除'
+        for key, sid, raw in victims:
+            print(f'{verb} {sid}：{raw[6:]}')
+            # 被刪的條目若擋著別人，對方會默默變成 ready —— 留痕在 log
+            for a, kind, b in con.execute(
+                    'SELECT f.short_id, d.kind, t.short_id FROM todo_dep d'
+                    ' LEFT JOIN todo f ON f.key=d.from_key'
+                    ' LEFT JOIN todo t ON t.key=d.to_key'
+                    ' WHERE d.from_key=? OR d.to_key=?', (key, key)).fetchall():
+                print(f'  ↳ 解除依賴：{a} {kind} {b}')
+            if not args.dry_run:
+                todo_store.remove_item(con, key, commit=False)
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
+    print(f'[{args.project_resolved}] 早於 {cutoff} 的未開工 pending：'
+          f'{verb} {len(victims)} 條')
+    if victims and not args.dry_run:
+        todo_store.write_mirror(con, args.project_resolved,
+                                mirror_path(args.project_resolved))
 
 
 def cmd_stats(con, args):
@@ -659,6 +714,13 @@ def main():
     p.add_argument('--line', type=int, help='只刪某一行；不給則刪整條')
     p.add_argument('--force', action='store_true', help='刪整條時必須明示')
     p.set_defaults(fn=cmd_rm)
+
+    p = sub.add_parser('prune', parents=[common],
+                       help='刪除建立超過 N 天、未開工的 pending（每週 cron 用）')
+    p.add_argument('--older-than-days', type=int, required=True)
+    p.add_argument('--dry-run', action='store_true', help='只列出，不刪')
+    p.add_argument('--today', help='YYYY-MM-DD，覆寫今天（測試用）')
+    p.set_defaults(fn=cmd_prune)
 
     p = sub.add_parser('stats', parents=[common])
     p.set_defaults(fn=cmd_stats)

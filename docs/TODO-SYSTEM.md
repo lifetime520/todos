@@ -85,7 +85,7 @@ hook 的判定是「路徑出現在工具參數裡」，不是「行程讀了那
 | 時機 | 為什麼 |
 |---|---|
 | **動工前**（要處理某條 todo） | 條目內的數字與行號都是快照。先確認它還成立，別做一件別的 session 已經做掉的事 |
-| **移除任何條目前** | **強制**。必須有錨點／commit 證據，禁止憑印象刪 |
+| **移除任何條目前** | **強制**。必須有錨點／commit 證據，禁止憑印象刪（唯一例外：下方「自動清除」） |
 | **定期整理**（距上次 >7 天，或條目 >100） | 防止再次累積到讀不動（曾累積到 198 條，其中 93 條堆在未分組區） |
 
 ```bash
@@ -112,6 +112,29 @@ DB 在 `~/.claude/todos/.audit/{project}.sqlite` —— 按專案隔離，且**�
 
 `rm --force` 是**抹除**，與上述三者不同：它連記錄一起刪掉，用於誤建的條目與測試垃圾。
 真的做完了請用 `done`，別用 `rm`。
+
+### 自動清除（每週 cron）
+
+每週日 04:00 由 cron 跑 `hooks/todo-prune.sh`，對所有專案刪除**建立超過 60 天、未開工**的 pending。
+這是「移除前需 audit 證據」的唯一例外：判準只看年齡與狀態，不看稽核結論，所以不受稽核器召回率影響。
+
+未開工 = `status='pending'` **且** `progress=0`（沒點過任何交付旗標）。以下一律不動：
+
+- `done`／`unpick` —— 歷史紀錄
+- `doing` —— 有人認領中
+- 點過旗標的 `pending` —— 已經開工，只是沒做完
+- `date='1970-01-01'` —— 標題解析不到日期時的預設值，代表「未知」而非「最舊」
+
+```bash
+bash ~/.claude/hooks/todo-prune.sh --dry-run        # 預覽所有專案
+python3 $T prune --older-than-days 60 [--dry-run]   # 單一專案
+```
+
+輸出在 `~/.cache/todo-prune/cron.log`（不放 `/tmp`：重開機清空後 redirect 目標目錄不存在，cron 會整條靜默不跑）。
+刪除是抹除，不留備份；被刪條目若有依賴邊，log 裡會列 `↳ 解除依賴`。
+
+保護：`--older-than-days` 下限 30（打錯成 0／負數會一次清光所有 pending）；選取與刪除在同一個
+`BEGIN IMMEDIATE` transaction 內，別的 session 此時的 mark doing／flag set 會等鎖，不會被抹掉。
 
 ### 複驗結果要寫回去
 
@@ -206,6 +229,7 @@ python3 $T edit <T-NNN> --title "新標題"           # 日期前綴自動保留
 python3 $T edit <T-NNN> "🏷️  新內容" --line 1      # 改某行（序號見 show --seq）
 python3 $T rm   <T-NNN> --line 2                   # 刪某行
 python3 $T rm   <T-NNN> --force                    # 永久刪除整條
+python3 $T prune --older-than-days 60 [--dry-run] # 刪超過 N 天未開工的 pending（cron 用）
 
 # 交付進度位元旗標（實作/review/commit/compile/test/live_tested/deploy）
 python3 $T flag <T-NNN> set <name>      # 例：flag T-042 set reviewed

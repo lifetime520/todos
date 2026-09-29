@@ -797,11 +797,12 @@ def remove_line(con, key, seq):
     con.commit()
 
 
-def remove_item(con, key):
+def remove_item(con, key, commit=True):
     """真正刪除條目及其所有關聯列。
 
     與 mark done/unpick 不同：那兩者保留記錄，這個是抹除。
     用於誤建的條目與測試垃圾 —— 那些留著會誤導後人。
+    commit=False 供呼叫端把多條刪除包進同一個 transaction（見 cmd_prune）。
     """
     for tbl in _KEYED_TABLES:
         con.execute(f'DELETE FROM {tbl} WHERE todo_key=?', (key,))
@@ -812,7 +813,8 @@ def remove_item(con, key):
     con.execute('DELETE FROM todo_dep WHERE from_key=?', (key,))
     con.execute('DELETE FROM todo_dep WHERE to_key=?', (key,))
     con.execute('DELETE FROM todo WHERE key=?', (key,))
-    con.commit()
+    if commit:
+        con.commit()
 
 
 def set_progress(con, key, op, name):

@@ -40,6 +40,7 @@ python3 $T note <T-NNN> "🔍  複驗結果…"          # 追加一行
 python3 $T edit <T-NNN> --title "新標題"         # key 與稽核歷史自動搬移
 python3 $T edit <T-NNN> "🏷️  新內容" --line 1
 python3 $T rm   <T-NNN> [--line N | --force]
+python3 $T prune --older-than-days 60 [--dry-run]   # 每週 cron；判準見 docs/TODO-SYSTEM.md「自動清除」
 python3 $T mark <T-NNN> {pending|doing|done|unpick} [--note "..."] [--by 誰] [--force]
 python3 $T flag <T-NNN> {set|clear|toggle} <name>    # name ∈ implemented/reviewed/committed/compiled/tested/live_tested/deployed
 python3 $T edit <T-NNN> --spec "docs/specs/xxx.md" --memory ".claude/memory/xxx.md"
