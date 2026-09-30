@@ -538,6 +538,9 @@ class TestClaimGuard(unittest.TestCase):
         msg = str(cm.exception)
         self.assertIn('sess-a', msg)
         self.assertIn('force', msg)
+        # 被擋的也可能是認領者本人忘了帶 --by（todo-done.sh 曾經根本不傳）；
+        # 只給 --force 會把合法認領者導向「強制接管」
+        self.assertIn('--by', msg)
 
     def test_release_clears_owner(self):
         # 標回 pending = 釋放。留著舊 status_by 會讓消費端分不出

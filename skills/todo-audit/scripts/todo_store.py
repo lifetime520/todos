@@ -536,7 +536,8 @@ def set_status(con, key, status, by=None, note=None, force=False):
         raise ClaimConflict(
             f'{cur[3] or key[:8]} 已被 {cur[1] or "(未署名)"} 認領於 '
             f'{cur[2] or "時間不明"}（{humanize_age(cur[2])}）。'
-            f'確定要接管就加 --force —— 先確認對方 session 真的已經結束')
+            f'若你就是認領者，帶上同一個 --by <識別碼> 即可；'
+            f'確定要接管他人的才加 --force —— 先確認對方 session 真的已經結束')
     old_status = cur[0]
     # pending = 無人持有。留著舊 status_by 會讓消費端把「上一個做過的人」
     # 讀成「現任擁有者」；status_at 則保留，它此時的語意是「何時釋放」。

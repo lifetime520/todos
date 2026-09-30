@@ -264,6 +264,7 @@ bash ~/.claude/hooks/todo-add.sh "任務" "🏷️  tag" "💡  recall"
 
 # 狀態流轉
 bash ~/.claude/hooks/todo-done.sh "標題行的一段關鍵字"   # 等同 mark ... done
+bash ~/.claude/hooks/todo-done.sh "T-NNN" --by <session識別碼>   # 已認領的條目必須帶同一個 --by
 python3 $T mark <T-NNN> doing --by <session識別碼>
 python3 $T mark <T-NNN> unpick --note "理由（必填）"
 
