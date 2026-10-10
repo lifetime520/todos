@@ -26,6 +26,9 @@ try:
     import todo_store
 except Exception:
     sys.exit(0)
+# hook 自己有 10 秒逾時（settings.json）：等鎖上限壓在其下，等不到就照原設計靜默退出，
+# 不被 harness 砍掉顯示逾時（store 預設 30 秒是給 CLI 用的）
+todo_store.BUSY_TIMEOUT_S = 3
 
 db, project = sys.argv[1:3]
 try:

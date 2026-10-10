@@ -198,7 +198,10 @@ def persist(db_path, todo_file, repo, todos, results, symbols, hit_rate, started
         chash = hashlib.sha1(('\n'.join(t['body'])).encode()).hexdigest()[:16]
         prev = cur.execute('SELECT content_hash FROM todo WHERE key=?', (k,)).fetchone()
         if prev is None:
-            cur.execute('INSERT INTO todo VALUES(?,?,?,?,?,?)',
+            # 明列欄位：store 遷移過的 DB 有 20 欄，位置式 VALUES 會直接拋錯。
+            # progress 不寫 —— 純 audit 建的 DB 沒有這欄；遷移過的 DB 由 connect() 補 0
+            cur.execute('INSERT INTO todo(key,date,title,first_seen_run,last_seen_run,'
+                        'content_hash) VALUES(?,?,?,?,?,?)',
                         (k, t['date'], t['title'], run_id, run_id, chash))
             changed += 1
         else:

@@ -603,8 +603,11 @@ class TestProgressFlags(unittest.TestCase):
         self.assertEqual(p, 0)
 
     def test_existing_done_rows_backfilled_to_full_progress_on_reconnect(self):
+        # 模擬「回填上線前」的舊 DB：未蓋 schema 指紋（user_version=0）。已蓋指紋的
+        # DB 上新出現的 NULL done 列不灌滿 —— 見 test_connect_lock.py
         self.con.execute("UPDATE todo SET status='done', progress=NULL"
                          " WHERE key=?", (self.key,))
+        self.con.execute('PRAGMA user_version = 0')
         self.con.commit()
         self.con.close()
         self.con = todo_store.connect(self.dbpath)

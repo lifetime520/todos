@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import zlib
 from datetime import datetime
 from pathlib import Path
 
@@ -14,7 +15,8 @@ import todo_deps
 import todo_flags
 
 # 既有六表由 todo_audit.py 的 SCHEMA 建立；此處只做增量 migration。
-# 每一項都必須是 idempotent —— connect() 每次呼叫都會全跑一遍。
+# 每一項都必須是 idempotent —— connect() 只在 schema 指紋不符時跑（見
+# _SCHEMA_FINGERPRINT），但多個程序可能同時首次遷移、各自全跑一遍。
 MIGRATIONS = [
     "ALTER TABLE todo ADD COLUMN raw_title TEXT",
     "ALTER TABLE todo ADD COLUMN section TEXT",
@@ -99,9 +101,42 @@ def todo_key(date, title):
     return hashlib.sha1(f"{date}|{title}".encode()).hexdigest()[:16]
 
 
+# 等鎖上限。sqlite3 預設 5 秒；多 session 共用同一份 todo DB 時，寫入端（audit、
+# 批次 mark）偶爾會持鎖超過 5 秒，讀取端等不到就拋 database is locked（tradingbot
+# T-722：tester register 因此把已認領的條目誤報「查無此條」）。測試可覆寫。
+BUSY_TIMEOUT_S = 30.0
+
+_SHORT_ID_INDEX = ("CREATE UNIQUE INDEX IF NOT EXISTS ux_todo_short_id"
+                   " ON todo(short_id) WHERE short_id IS NOT NULL")
+
+# schema 指紋，蓋在 PRAGMA user_version。由 schema／migration 原文算出，任何一項
+# 改動都會換指紋 —— 新增 migration 不必手動遞增版號，也不會忘記。
+_SCHEMA_FINGERPRINT = (zlib.crc32('\n'.join(
+    [BASE_SCHEMA, *MIGRATIONS, _SHORT_ID_INDEX, str(todo_flags.ALL_FLAGS)]).encode())
+    & 0x7FFFFFFF) or 1
+
+
 def connect(db_path):
-    """開啟 DB 並套用所有 migration。可重複呼叫。"""
-    con = sqlite3.connect(str(db_path))
+    """開啟 DB 並套用所有 migration。可重複呼叫。
+
+    指紋相符（已遷移）時不跑任何 DDL／回填：唯讀指令（show、list）因此不搶寫鎖，
+    別的程序在寫時也讀得到。唯一例外是 progress 仍有 NULL 的列（todo_audit.persist
+    新增的條目不寫 progress）—— 先唯讀查到才補 0；補不到（被鎖）就留給下次，
+    讀取端一律把 NULL 當 0。
+    """
+    con = sqlite3.connect(str(db_path), timeout=BUSY_TIMEOUT_S)
+    if con.execute('PRAGMA user_version').fetchone()[0] == _SCHEMA_FINGERPRINT:
+        if con.execute('SELECT 1 FROM todo WHERE progress IS NULL LIMIT 1').fetchone():
+            # 不套用下面「done 灌滿旗標」的一次性回填：遷移後才出現的 NULL done 列
+            # 是 audit 插入後被標 done 的，灌成 ALL_FLAGS 等於憑空宣告已部署、已驗收
+            try:
+                con.execute("UPDATE todo SET progress=0 WHERE progress IS NULL")
+                con.commit()
+            except sqlite3.OperationalError as e:
+                if 'locked' not in str(e):
+                    raise
+                con.rollback()
+        return con
     con.executescript(BASE_SCHEMA)
     for stmt in MIGRATIONS:
         try:
@@ -110,14 +145,13 @@ def connect(db_path):
             # 欄位已存在是預期的（idempotent）；其他錯誤照拋
             if 'duplicate column name' not in str(e):
                 raise
-    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_todo_short_id"
-                " ON todo(short_id) WHERE short_id IS NOT NULL")
+    con.execute(_SHORT_ID_INDEX)
     # progress 的一次性 backfill：既有 done 條目視為已跑完整個 pipeline，
-    # 其餘一律未知＝0。之後每次呼叫都是 no-op —— 補滿後 `progress IS NULL`
-    # 不會再命中任何列，migration 保持 idempotent。
+    # 其餘一律未知＝0。只在蓋指紋前（舊 DB 首次開啟、或 schema 改動後）跑。
     con.execute("UPDATE todo SET progress=? WHERE status='done'"
                 " AND progress IS NULL", (todo_flags.ALL_FLAGS,))
     con.execute("UPDATE todo SET progress=0 WHERE progress IS NULL")
+    con.execute(f'PRAGMA user_version = {_SCHEMA_FINGERPRINT}')
     con.commit()
     return con
 
