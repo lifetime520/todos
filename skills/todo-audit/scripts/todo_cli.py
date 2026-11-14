@@ -15,6 +15,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import todo_coord
 import todo_deps
 import todo_flags
 import todo_store
@@ -491,6 +492,94 @@ def _resolve_ref_path(base, value):
     return p if p.is_absolute() else base / value
 
 
+def _me(args):
+    return getattr(args, 'by', None) or todo_coord.name_for_current_process() or '(未知 session)'
+
+
+def cmd_board(con, args):
+    print(todo_coord.board_text(con, max_chars=10_000))
+    return 0
+
+
+def cmd_role(con, args):
+    if args.action == 'set':
+        if not args.name or not args.role:
+            print('用法：role set <session> <role> [--reports-to <session>]', file=sys.stderr)
+            return 2
+        try:
+            todo_coord.role_set(con, args.name, args.role, reports_to=args.reports_to)
+        except ValueError as e:
+            print(f'❌ {e}', file=sys.stderr)
+            return 2
+        print(f'{todo_coord.short_name(args.name)} → {todo_coord.ROLES[args.role]}'
+              + (f'（←{todo_coord.short_name(args.reports_to)}）' if args.reports_to else ''))
+        return 0
+    for r in con.execute('SELECT name, role, reports_to, updated_at FROM coord_role ORDER BY name'):
+        print(f'{r[0]}  {todo_coord.ROLES.get(r[1], r[1])}'
+              + (f'  ←{r[2]}' if r[2] else '') + f'  @ {r[3]}')
+    return 0
+
+
+def _print_owner(o):
+    extra = '  '.join(x for x in (o['role'] and f'角色={o["role"]}',
+                                  o['todo_ids'] and f'todo={o["todo_ids"]}') if x)
+    print(f'{o["topic"]}  →  {o["owner"]}  {extra}  @ {o["updated_at"]} by {o["updated_by"] or "?"}')
+
+
+def cmd_owner(con, args):
+    if args.action == 'set':
+        if not args.topic or not args.owner:
+            print('用法：owner set <題目> <session> [--role R] [--todo T-NNN]', file=sys.stderr)
+            return 2
+        todo_coord.owner_set(con, args.topic, args.owner, role=args.role,
+                             todo_ids=args.todo, by=_me(args))
+        print(f'{args.topic} → {todo_coord.short_name(args.owner)}')
+        return 0
+    if args.action == 'rm':
+        ok = todo_coord.owner_rm(con, args.topic or '')
+        print('已移除' if ok else '查無此題目')
+        return 0 if ok else 1
+    rows = (todo_coord.owner_who(con, args.topic) if args.action == 'who'
+            else todo_coord.owner_list(con))
+    if not rows:
+        print('查無擁有者登記。若有人在做卻沒登記，請先 owner set。')
+        return 1 if args.action == 'who' else 0
+    for o in rows:
+        _print_owner(o)
+    return 0
+
+
+def cmd_decision(con, args):
+    if args.action == 'add':
+        if not args.topic or not args.quote:
+            print('用法：decision add --topic … --quote …（Cast 原文）', file=sys.stderr)
+            return 2
+        try:
+            did = todo_coord.decision_add(con, args.topic, args.quote, summary=args.summary,
+                                          supersedes=args.supersedes,
+                                          asked_by=args.asked_by or _me(args),
+                                          decided_at=args.at, id=args.id)
+        except (ValueError, sqlite3.IntegrityError) as e:
+            print(f'❌ {e}', file=sys.stderr)
+            return 2
+        print(did + (f'（取代 {args.supersedes}）' if args.supersedes else ''))
+        return 0
+    rows = (todo_coord.decision_match(con, args.text or '', limit=5) if args.action == 'match'
+            else todo_coord.decision_list(con, topic=args.text, include_all=args.all))
+    if not rows:
+        print('查無裁決。')
+        return 0
+    for d in rows:
+        tag = '' if d['status'] == 'active' else f'［{d["status"]}］'
+        print(f'{d["id"]}{tag}  {d["decided_at"]}  {d["topic"]}')
+        print(f'    原文：{d["cast_quote"]}')
+        if d['summary']:
+            print(f'    摘要：{d["summary"]}')
+        if d['supersedes']:
+            print(f'    取代：{d["supersedes"]}')
+    return 0
+
+
 def cmd_doctor(con, args):
     """自我診斷（REQ-3）。逐行 OK/WARN/FAIL 前綴、純文字無顏色、可 grep，
     exit code 恆為 0 —— 診斷工具的職責是印出發現，不是自己跑不起來。
@@ -771,6 +860,39 @@ def main():
     p = sub.add_parser('init', parents=[common],
                        help='為新專案建立待辦庫（唯一會建庫的指令）')
     p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser('board', parents=[common], help='誰在做什麼：存活 session × 角色 × 負責題目')
+    p.set_defaults(fn=cmd_board)
+
+    p = sub.add_parser('role', parents=[common], help='session 角色')
+    p.add_argument('action', choices=['set', 'list'])
+    p.add_argument('name', nargs='?')
+    p.add_argument('role', nargs='?', choices=sorted(todo_coord.ROLES))
+    p.add_argument('--reports-to')
+    p.set_defaults(fn=cmd_role)
+
+    p = sub.add_parser('owner', parents=[common], help='題目擁有者（一題一 session）')
+    p.add_argument('action', choices=['set', 'who', 'list', 'rm'])
+    p.add_argument('topic', nargs='?')
+    p.add_argument('owner', nargs='?')
+    p.add_argument('--role')
+    p.add_argument('--todo')
+    p.add_argument('--by')
+    p.set_defaults(fn=cmd_owner)
+
+    p = sub.add_parser('decision', parents=[common], help='Cast 裁決紀錄')
+    p.add_argument('action', choices=['add', 'list', 'match'])
+    p.add_argument('text', nargs='?', help='list：題目關鍵字；match：要比對的問題文字')
+    p.add_argument('--topic')
+    p.add_argument('--quote', help='Cast 原文（必填）')
+    p.add_argument('--summary')
+    p.add_argument('--supersedes')
+    p.add_argument('--asked-by')
+    p.add_argument('--at', help='裁決時間（預設現在）')
+    p.add_argument('--id', help='指定編號（遷移用）')
+    p.add_argument('--all', action='store_true', help='含已被取代的')
+    p.add_argument('--by')
+    p.set_defaults(fn=cmd_decision)
 
     p = sub.add_parser('doctor', parents=[common],
                        help='自我診斷：DB／search_dirs／稽核新鮮度是否正常'

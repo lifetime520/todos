@@ -93,6 +93,14 @@ CREATE TABLE IF NOT EXISTS todo_event(
   old_value TEXT, new_value TEXT,
   by TEXT, at TEXT);
 CREATE INDEX IF NOT EXISTS ix_event_todo ON todo_event(todo_key);
+CREATE TABLE IF NOT EXISTS coord_role(
+  name TEXT PRIMARY KEY, role TEXT NOT NULL, reports_to TEXT, updated_at TEXT);
+CREATE TABLE IF NOT EXISTS coord_owner(
+  topic TEXT PRIMARY KEY, owner TEXT NOT NULL, role TEXT, todo_ids TEXT,
+  updated_at TEXT, updated_by TEXT);
+CREATE TABLE IF NOT EXISTS coord_decision(
+  id TEXT PRIMARY KEY, decided_at TEXT, topic TEXT NOT NULL, cast_quote TEXT NOT NULL,
+  summary TEXT, supersedes TEXT, asked_by TEXT, status TEXT NOT NULL DEFAULT 'active');
 """
 
 
