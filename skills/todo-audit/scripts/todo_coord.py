@@ -64,34 +64,163 @@ def window_name(con):
 
 # ---------------------------------------------------------------- 題目擁有者
 
+# 沒有待辦編號的紀錄無法跟著待辦結案自動釋放，只能靠到期：超過這個時數沒有再
+# owner set 就不再列出（owner list --all 仍看得到）。還在做就重新 set 一次。
+OWNER_NOID_TTL_H = 48
+
+_ID_RE = re.compile(r'T-\d+')
+_LEAD_ID_RE = re.compile(r'\s*(T-\d+)(?=\s|$)')
+
+
+def _norm_ids(todo_ids, topic):
+    """回傳正規化的編號字串（「T-1, T-2」），沒有編號回 None。
+    未帶 todo_ids 時取題目開頭的 T-NNN —— 歸屬能否隨待辦結案自動釋放，
+    全看這個欄位有沒有值。"""
+    ids = _ID_RE.findall(todo_ids or '')
+    if not ids:
+        m = _LEAD_ID_RE.match(topic or '')
+        ids = [m.group(1)] if m else []
+    seen = []
+    for x in ids:
+        if x not in seen:
+            seen.append(x)
+    return ', '.join(seen) or None
+
+
 def owner_set(con, topic, owner, role=None, todo_ids=None, by=None):
+    """登記題目擁有者。同一組待辦編號只留一筆：題目文字換了寫法視為同一題，
+    舊紀錄在同一交易內刪除（T-990 曾因文字不同登記兩筆）。"""
+    topic = topic.strip()
+    ids = _norm_ids(todo_ids, topic)
+    if ids:
+        want = set(ids.split(', '))
+        for t, other in con.execute(
+                'SELECT topic, todo_ids FROM coord_owner WHERE topic<>? AND todo_ids IS NOT NULL',
+                (topic,)).fetchall():
+            if set(_ID_RE.findall(other)) == want:
+                con.execute('DELETE FROM coord_owner WHERE topic=?', (t,))
     con.execute(
         'INSERT INTO coord_owner(topic, owner, role, todo_ids, updated_at, updated_by)'
         ' VALUES(?,?,?,?,?,?) ON CONFLICT(topic) DO UPDATE SET owner=excluded.owner,'
         ' role=excluded.role, todo_ids=excluded.todo_ids,'
         ' updated_at=excluded.updated_at, updated_by=excluded.updated_by',
-        (topic.strip(), short_name(owner), role, todo_ids, _now(), by))
+        (topic, short_name(owner), role, ids, _now(), by))
     con.commit()
 
 
-def owner_who(con, keyword):
+def _expired(row, now=None):
+    if row['todo_ids']:
+        return False
+    try:
+        age = ((now or datetime.now()) - datetime.fromisoformat(row['updated_at'])).total_seconds()
+    except (TypeError, ValueError):
+        return True  # 時間壞掉的無編號紀錄沒有任何依據說它還在做
+    return age > OWNER_NOID_TTL_H * 3600
+
+
+def owner_who(con, keyword, include_expired=False):
     kw = f'%{keyword.strip().lower()}%'
     cur = con.execute(
         'SELECT topic, owner, role, todo_ids, updated_at, updated_by FROM coord_owner'
         " WHERE lower(topic) LIKE ? OR lower(coalesce(todo_ids,'')) LIKE ?"
         ' ORDER BY updated_at DESC', (kw, kw))
     keys = ('topic', 'owner', 'role', 'todo_ids', 'updated_at', 'updated_by')
-    return [dict(zip(keys, r)) for r in cur.fetchall()]
+    out = []
+    for r in cur.fetchall():
+        d = dict(zip(keys, r))
+        d['expired'] = _expired(d)
+        if include_expired or not d['expired']:
+            out.append(d)
+    return out
 
 
-def owner_list(con):
-    return owner_who(con, '')
+def owner_list(con, include_expired=True):
+    """完整登記。預設含過期紀錄（帶 expired 旗標、CLI 會標 ⌛）：castpower 徵用閘門
+    解析這份輸出，錯誤方向只能往「列出」偏，過期只在 who 與看板隱藏。"""
+    return owner_who(con, '', include_expired=include_expired)
 
 
 def owner_rm(con, topic):
     n = con.execute('DELETE FROM coord_owner WHERE topic=?', (topic.strip(),)).rowcount
     con.commit()
     return n > 0
+
+
+def owner_prune(con, dry_run=False):
+    """清掉自動釋放上線前留下的殘留：待辦已結案的編號從紀錄拿掉（拿光就刪），
+    同一組編號的重複紀錄只留最新一筆，未帶 todo_ids 的紀錄補上題目開頭的編號。
+    回傳每個動作的說明。冪等。dry_run 時整批 rollback，只回報會做什麼。"""
+    msgs = []
+    closed = {r[0] for r in con.execute(
+        "SELECT short_id FROM todo WHERE status IN ('done','unpick') AND short_id IS NOT NULL")}
+    rows = con.execute('SELECT topic, todo_ids FROM coord_owner'
+                       ' ORDER BY updated_at DESC').fetchall()
+    seen = {}
+    for topic, ids in rows:
+        norm = _norm_ids(ids, topic)
+        if norm != ids:
+            con.execute('UPDATE coord_owner SET todo_ids=? WHERE topic=?', (norm, topic))
+            msgs.append(f'補編號：{topic} → {norm}')
+        if not norm:
+            continue
+        parts = norm.split(', ')
+        rest = [x for x in parts if x not in closed]
+        if not rest:
+            con.execute('DELETE FROM coord_owner WHERE topic=?', (topic,))
+            msgs.append(f'刪除（待辦已結案）：{topic}')
+            continue
+        if rest != parts:
+            norm = ', '.join(rest)
+            con.execute('UPDATE coord_owner SET todo_ids=? WHERE topic=?', (norm, topic))
+            msgs.append(f'拿掉已結案編號：{topic} → {norm}')
+        k = frozenset(rest)
+        if k in seen:
+            con.execute('DELETE FROM coord_owner WHERE topic=?', (topic,))
+            msgs.append(f'刪除重複（保留「{seen[k]}」）：{topic}')
+        else:
+            seen[k] = topic
+    if dry_run:
+        con.rollback()
+    else:
+        con.commit()
+    return msgs or ['沒有需要清理的紀錄。']
+
+
+# ---------------------------------------------------------------- 孤兒認領
+
+WS_ROOT = Path(os.environ.get('TODO_WS_ROOT') or Path.home() / 'WorkSpace' / 'ws')
+
+
+def _ws_exists(root, name, project=None):
+    """session-ws 的工作區目錄是 <專案>-<名稱>。知道專案就精確比對；不知道才退回
+    後綴比對（會把 ws:t2 誤認成 tradingbot-coinm-t2 —— 寧可少報孤兒，不誤報）。"""
+    if (root / name).is_dir():
+        return True
+    if project:
+        return (root / f'{project}-{name}').is_dir()
+    return any(p.is_dir() for p in root.glob(f'*-{name}'))
+
+
+def orphan_claims(con, ws_root=None):
+    """doing 認領者是 ws:<名稱>，但工作區目錄已不存在的條目。只列出、不改狀態：
+    工作區刪掉不代表沒在等驗收（實作完、等部署後驗收的 doing 也長這樣），
+    所以附上最後活動時間（狀態變更或 note），交給人判斷。"""
+    root = Path(ws_root or WS_ROOT)
+    if not root.is_dir():
+        return []  # 這台機器沒有工作區根目錄：無從判斷，不能把每條都報成孤兒
+    pp = project_path_of(con)
+    project = Path(pp).name if pp else None
+    out = []
+    for key, sid, title, by, at in con.execute(
+            "SELECT key, short_id, title, status_by, status_at FROM todo"
+            " WHERE status='doing' AND status_by LIKE 'ws:%' ORDER BY sort_order").fetchall():
+        name = by[3:]
+        if not name or _ws_exists(root, name, project):
+            continue
+        last = con.execute('SELECT MAX(at) FROM todo_event WHERE todo_key=?', (key,)).fetchone()[0]
+        out.append({'short_id': sid, 'title': title, 'by': by, 'claimed_at': at,
+                    'last_activity': max(filter(None, (last, at)), default=None)})
+    return out
 
 
 # ---------------------------------------------------------------- 裁決
@@ -233,7 +362,7 @@ def project_path_of(con):
 
 def board_rows(con, sessions_dir=None):
     owners = {}
-    for o in owner_list(con):
+    for o in owner_list(con, include_expired=False):
         owners.setdefault(o['owner'], []).append(o['topic'])
     rows = []
     for s in live_sessions(sessions_dir, project_path_of(con)):
@@ -267,6 +396,11 @@ def board_text(con, sessions_dir=None, max_chars=600):
         if r['warn']:
             line += f' ⚠ {r["warn"]}'
         lines.append(line)
+    orphans = orphan_claims(con)
+    if orphans:  # 放在標題後：看板超長會從尾端截斷
+        lines.insert(1, f'⚠ 孤兒認領 {len(orphans)} 條（工作區已不存在）：'
+                     + '、'.join(o['short_id'] for o in orphans[:6])
+                     + ('…' if len(orphans) > 6 else '') + '（todo_cli.py orphans）')
     text = '\n'.join(lines)
     if len(text) > max_chars:
         text = text[:max_chars - 1] + '…'

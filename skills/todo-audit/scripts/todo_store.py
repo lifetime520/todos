@@ -589,7 +589,40 @@ def set_status(con, key, status, by=None, note=None, force=False):
                 (status, owner, datetime.now().isoformat(timespec='seconds'),
                  note, key))
     _record_event(con, key, 'status', old_status, status, by)
+    if status in _CLOSED and old_status not in _CLOSED:
+        release_owner_rows(con, cur[3])
     con.commit()
+
+
+# 結案狀態：進入時釋放題目擁有者紀錄。unpick 也算 —— 擱置的題目沒有人在負責，
+# 留在看板上的「負責：…」就是錯的。
+_CLOSED = ('done', 'unpick')
+
+
+def _split_ids(text):
+    return re.findall(r'T-\d+', text or '')
+
+
+def release_owner_rows(con, short_id):
+    """待辦結案時，從 coord_owner 拿掉這個編號；紀錄的編號全部拿光才刪整筆。
+    不 commit —— 由呼叫端與狀態變更同一交易提交，避免狀態改了、歸屬沒清。"""
+    if not short_id:
+        return 0
+    n = 0
+    for topic, ids in con.execute(
+            "SELECT topic, todo_ids FROM coord_owner WHERE todo_ids LIKE ?",
+            (f'%{short_id}%',)).fetchall():
+        parts = _split_ids(ids)
+        if short_id not in parts:
+            continue  # LIKE 命中 T-990 但要找的是 T-99
+        rest = [x for x in parts if x != short_id]
+        if rest:
+            con.execute('UPDATE coord_owner SET todo_ids=? WHERE topic=?',
+                        (', '.join(rest), topic))
+        else:
+            con.execute('DELETE FROM coord_owner WHERE topic=?', (topic,))
+        n += 1
+    return n
 
 
 def append_item(con, project, title, tags, note):
@@ -699,6 +732,8 @@ def append_note(con, key, text):
     raw = f'  > {text}'
     con.execute('INSERT INTO todo_line VALUES(?,?,?,?)',
                 (key, seq, line_marker(raw), raw))
+    # 留時間戳：孤兒認領清單要顯示「最後活動」，note 是等驗收期間最常見的活動。
+    _record_event(con, key, 'note', None, text[:200], None)
     con.commit()
     return seq
 
@@ -883,6 +918,8 @@ def set_progress(con, key, op, name):
     if todo_flags.is_complete(new_progress) and status not in ('unpick', 'done'):
         con.execute('UPDATE todo SET status=?, status_at=? WHERE key=?',
                     ('done', datetime.now().isoformat(timespec='seconds'), key))
+        sid = con.execute('SELECT short_id FROM todo WHERE key=?', (key,)).fetchone()[0]
+        release_owner_rows(con, sid)
     con.commit()
     return new_progress
 

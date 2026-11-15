@@ -523,7 +523,8 @@ def cmd_role(con, args):
 def _print_owner(o):
     extra = '  '.join(x for x in (o['role'] and f'角色={o["role"]}',
                                   o['todo_ids'] and f'todo={o["todo_ids"]}') if x)
-    print(f'{o["topic"]}  →  {o["owner"]}  {extra}  @ {o["updated_at"]} by {o["updated_by"] or "?"}')
+    tail = f'  ⌛ 無編號且逾 {todo_coord.OWNER_NOID_TTL_H} 小時未更新，視為已結案' if o.get('expired') else ''
+    print(f'{o["topic"]}  →  {o["owner"]}  {extra}  @ {o["updated_at"]} by {o["updated_by"] or "?"}{tail}')
 
 
 def cmd_owner(con, args):
@@ -535,17 +536,36 @@ def cmd_owner(con, args):
                              todo_ids=args.todo, by=_me(args))
         print(f'{args.topic} → {todo_coord.short_name(args.owner)}')
         return 0
+    if args.action == 'prune':
+        for msg in todo_coord.owner_prune(con, dry_run=args.dry_run):
+            print(msg)
+        return 0
     if args.action == 'rm':
         ok = todo_coord.owner_rm(con, args.topic or '')
         print('已移除' if ok else '查無此題目')
         return 0 if ok else 1
-    rows = (todo_coord.owner_who(con, args.topic) if args.action == 'who'
-            else todo_coord.owner_list(con))
+    rows = (todo_coord.owner_who(con, args.topic, include_expired=args.all)
+            if args.action == 'who' else todo_coord.owner_list(con))
     if not rows:
         print('查無擁有者登記。若有人在做卻沒登記，請先 owner set。')
         return 1 if args.action == 'who' else 0
     for o in rows:
         _print_owner(o)
+    return 0
+
+
+def cmd_orphans(con, args):
+    rows = todo_coord.orphan_claims(con)
+    if not rows:
+        print('沒有孤兒認領（doing 且認領的工作區都還在）。')
+        return 0
+    print(f'孤兒認領 {len(rows)} 條：認領者是 ws:<名稱>，但 {todo_coord.WS_ROOT} 下已無該工作區。')
+    print('不一定是遺棄 —— 可能是實作完、等部署後驗收。看最後活動時間判斷；'
+          '確定沒人在做就 mark <T> pending --by <原認領者>。')
+    for r in rows:
+        print(f'  {r["short_id"]}  {r["by"]}  認領 {r["claimed_at"]}'
+              f'  最後活動 {r["last_activity"]}（{todo_store.humanize_age(r["last_activity"])}）'
+              f'  {r["title"]}')
     return 0
 
 
@@ -872,13 +892,20 @@ def main():
     p.set_defaults(fn=cmd_role)
 
     p = sub.add_parser('owner', parents=[common], help='題目擁有者（一題一 session）')
-    p.add_argument('action', choices=['set', 'who', 'list', 'rm'])
+    p.add_argument('action', choices=['set', 'who', 'list', 'rm', 'prune'])
     p.add_argument('topic', nargs='?')
     p.add_argument('owner', nargs='?')
     p.add_argument('--role')
     p.add_argument('--todo')
     p.add_argument('--by')
+    p.add_argument('--all', action='store_true',
+                   help=f'who：含無編號且逾 {todo_coord.OWNER_NOID_TTL_H} 小時的紀錄（list 一律全列）')
+    p.add_argument('--dry-run', action='store_true', help='prune：只列出會做什麼，不寫入')
     p.set_defaults(fn=cmd_owner)
+
+    p = sub.add_parser('orphans', parents=[common],
+                       help='孤兒認領：doing 但認領的工作區已不存在（只列出、不改狀態）')
+    p.set_defaults(fn=cmd_orphans)
 
     p = sub.add_parser('decision', parents=[common], help='Cast 裁決紀錄')
     p.add_argument('action', choices=['add', 'list', 'match'])
