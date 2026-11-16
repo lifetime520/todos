@@ -17,7 +17,7 @@ CONTEXT_WARN_TOKENS = 150_000
 _TAIL_BYTES = 4 * 1024 * 1024
 
 DESIGN_KEYWORDS = re.compile(
-    r'歸屬|記帳|帳本|對帳|資金費|淨倉|拆帳|attribution|ledger|funding', re.I)
+    r'歸屬|記帳|帳本|對帳|資金費|淨倉|拆帳|attribution|funding', re.I)  # 不含 ledger：castpower 的 run 紀錄也叫 ledger
 DESIGN_DOCS = ('docs/knowledge/position-attribution-model.md', 'docs/audit/PITFALLS.md')
 LOCK_PREMISE = re.compile(r'不要(建議)?推翻|不得(挑戰|推翻|質疑)|不要(挑戰|質疑)|勿(推翻|質疑)|前提不可')
 # 只看 Agent 的 description／subagent_type 判定「審查型」，不掃 prompt 全文：

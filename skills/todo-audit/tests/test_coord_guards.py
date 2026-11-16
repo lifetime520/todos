@@ -93,6 +93,10 @@ class TestDesignDocs(unittest.TestCase):
         out = g.design_docs_guard('SendMessage', '資金費拆帳要怎麼算', self.root)
         self.assertIn('decision list', out['additionalContext'])
 
+    def test_castpower_ledger_word_silent(self):
+        # 2026-11-16 實際誤觸發：castpower 的 ledger（run 紀錄檔）與倉位帳本無關
+        self.assertIsNone(g.design_docs_guard('Agent', '審查 cmd_seal：ledger 回補判定與 accheck PASS', self.root))
+
     def test_unrelated_text_silent(self):
         self.assertIsNone(g.design_docs_guard('Agent', '修 UI 按鈕顏色', self.root))
 
