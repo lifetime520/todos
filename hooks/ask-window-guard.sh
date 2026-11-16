@@ -6,8 +6,10 @@
 # 各自提問導致 Cast 在不知情下給出互相矛盾的指示（§5.5-3 30 小時翻三次；
 # D-006 vs D-005）。這個 hook 在提問前把「該送窗口」與「已有的裁決」放到模型眼前。
 #
-# 只提示、不阻擋：輸出 hookSpecificOutput.additionalContext，不帶 permissionDecision，
-# exit 恆為 0。任何錯誤（DB 鎖、找不到 session）都靜默放行。
+# 非窗口只提示、不阻擋：輸出 hookSpecificOutput.additionalContext，exit 恆為 0。
+# 窗口本身一律擋下（2026-11-16 Cast 核准，#13 績效診斷）：AskUserQuestion 會讓窗口停擺，
+# #13 實測 17 次合計 3302 分鐘、期間 26 則 peer 訊息排隊。判斷邏輯在 coord_guards.ask_guard。
+# 任何錯誤（DB 鎖、找不到 session）都靜默放行。
 INPUT="$(cat)"
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$_SCRIPT_DIR/lib/project-resolve.sh"
@@ -20,7 +22,7 @@ import json, os, sys
 from pathlib import Path
 sys.path.insert(0, str(Path.home() / '.claude/skills/todo-audit/scripts'))
 try:
-    import todo_store, todo_coord
+    import todo_store, todo_coord, coord_guards
     todo_store.BUSY_TIMEOUT_S = 2
     inp = json.loads(os.environ.get('HOOK_INPUT') or '{}')
     con = todo_store.connect(sys.argv[1])
@@ -33,14 +35,22 @@ r = todo_coord.role_get(con, sn) if sn else None
 win = todo_coord.window_name(con)
 qs = (inp.get('tool_input') or {}).get('questions') or []
 text = ' '.join(f"{q.get('question','')} {q.get('header','')}" for q in qs if isinstance(q, dict))
-hits = todo_coord.decision_match(con, text, limit=3)
+try:
+    hits = todo_coord.decision_match(con, text, limit=3)
+except Exception:
+    hits = []  # 裁決查詢失敗不影響窗口的 deny
+
+deny = coord_guards.ask_guard(r['role'] if r else None)
+if deny:
+    for d in hits:
+        q = d['cast_quote'] if len(d['cast_quote']) <= 80 else d['cast_quote'][:79] + '…'
+        deny['permissionDecisionReason'] += f'\n相關現行裁決 {d["id"]}（{d["topic"]}）：{q}'
+    print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', **deny}},
+                     ensure_ascii=False))
+    sys.exit(0)
 
 lines = []
-if r and r['role'] == 'window':
-    lines.append('【協定 v2・窗口提問前檢查】① 已有裁決就直接回覆，不重問 ② 同類問題合併'
-                 ' ③ 可能衝突的舊裁決原文並列，明確問 Cast「要不要取代」。'
-                 '問完用 todo_cli decision add 記錄（--supersedes 標取代）。')
-elif win and sn != win:
+if win and sn != win:
     lines.append(f'【協定 v2】設計／決策問題（影響 spec、規則或其他題目）請 SendMessage 給 {win}，'
                  '不要直接問 Cast；只有 Cast 在本 session 親自下指令時，才能直接問自己負責、'
                  '不影響別人的執行細節。若屬後者可繼續。')
