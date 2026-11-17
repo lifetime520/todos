@@ -227,7 +227,7 @@ def orphan_claims(con, ws_root=None):
 
 # peer 不需窗口回應的回報（進度、已照辦、PASS 通知）寫這裡，窗口被任何理由喚醒時
 # 由 window-inbox.sh 一次注入。實測（#13 transcript 11-06～11-16）：153 段 peer 喚醒中
-# 「讀完沒回」＋「只回收到」占 31% cache read。積壓超過這個分鐘數、且這段時間內沒彙整過，
+# 「讀完沒回」占 18% cache read（原估「只回收到」13% 經逐則檢查是裁決轉達，不計）。積壓超過這個分鐘數、且這段時間內沒彙整過，
 # 下一則 post 會要求寄件者另送一則【彙整】喚醒窗口（系統排程無法送 SendMessage）。
 INBOX_FLUSH_MIN = 60
 INBOX_MAX_CHARS = 2000  # 單則上限；長內容寫檔後附路徑

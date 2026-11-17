@@ -130,7 +130,7 @@ def peer_message_guard(sender, target, window, message):
         if target and target != window and _is_pure_ack(message):
             return {'permissionDecision': 'deny', 'permissionDecisionReason': (
                 '【窗口不回純確認】只回「收到／了解」會再喚醒對方一次、整份 context 重讀'
-                '（D-048：#13 實測只回收到的段占 13% 成本）。沒有裁示或指示就不用回；'
+                '（D-048）。沒有裁示或指示就不用回；'
                 '要回就附上實質內容。')}
         return None
     if target != window or PEER_TAG_RE.search((message or '')[:PEER_TAG_WINDOW]):
@@ -140,7 +140,7 @@ def peer_message_guard(sender, target, window, message):
         f'{"／".join("【" + t + "】" for t in PEER_TAGS)}其中之一再送。'
         '不需要回應的（進度、已照辦、已推送待 tester、PASS 通知）改寫收件匣，窗口下次醒來會一次看到：'
         'python3 ~/.claude/skills/todo-audit/scripts/todo_cli.py inbox post "<內容>" --todo T-NNN'
-        '（D-048：#13 實測讀完沒回＋只回收到的喚醒占 31% 成本）。')}
+        '（D-048：#13 實測讀完沒回的喚醒占 18% 成本）。')}
 
 
 def inbox_inject_text(items):
