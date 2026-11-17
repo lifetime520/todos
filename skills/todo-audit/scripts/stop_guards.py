@@ -24,6 +24,7 @@ EXTERNAL_WAIT_RE = re.compile(
     r'\s*(後|之後|時|以後)|等\s*(#\d|tester|Task|task|它|他們|agent|測試|佇列|fast|部署|#)|完成後我會收到通知|'
     r'(?<![稍之以待然隨最])後[，,]?\s*(我|就|再|接著|會)|[^\s，,。、稍待然隨以]之後[，,]?\s*(我|就|接著|會)|'
     r'完[，,]?\s*(我|就|再|接著|會)')
+QUOTED_RE = re.compile(r'「[^「」]*」|`[^`\n]*`')
 STALE_AGE_S = 2 * 3600
 BASH_TOOL_MARK = 'shell-snapshots'
 _TAIL_BYTES = 4 * 1024 * 1024
@@ -33,7 +34,8 @@ def future_guard(text, used_ask, stop_hook_active):
     """結尾有未來式承諾、又沒提問時回傳擋下理由，否則 None。"""
     if stop_hook_active or used_ask or not text:
         return None
-    tail = text[-TAIL_CHARS:]
+    # 引述（「…」、`…`）裡的字不是自己的承諾，比對前先遮掉（2026-11-18 引述句型被誤擋）
+    tail = QUOTED_RE.sub(lambda m: '□' * len(m.group()), text[-TAIL_CHARS:])
     if QUESTION_RE.search(tail):
         return None
     m = USER_WAIT_RE.search(tail)

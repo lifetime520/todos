@@ -85,6 +85,16 @@ class TestFutureGuard(unittest.TestCase):
                   '這次不需要等你確認，我已直接做完。', '不必等你確認，已做完。'):
             self.assertIsNone(g.future_guard(t, False, False), t)
 
+    def test_quoted_phrases_ignored(self):
+        # 2026-11-18 實際誤擋：引述句型「還在等你決定」不是自己的承諾
+        for t in ('多數是「還在等你決定」卻沒用問句結尾，這是刻意要擋的。',
+                  '結尾寫了「我會先提出設計，等你確認後再實作」就結束回合。',
+                  '偵測 `我會` 這類字樣。'):
+            self.assertIsNone(g.future_guard(t, False, False), t)
+
+    def test_promise_outside_quotes_still_blocks(self):
+        self.assertIsNotNone(g.future_guard('「A」選項我會再研究，等你確認後再做。', False, False))
+
     def test_empty_or_none_allows(self):
         self.assertIsNone(g.future_guard('', False, False))
         self.assertIsNone(g.future_guard(None, False, False))
