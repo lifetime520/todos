@@ -1082,5 +1082,49 @@ class TestNonDoctorCommandRejectsBindingConflict(unittest.TestCase):
         self.assertIn('不能共用待辦', r.stdout + r.stderr)
 
 
+
+class TestInboxCli(unittest.TestCase):
+    """B 案（D-048）：todo_cli inbox post／list。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        audit = self.home / '.claude' / 'todos' / '.audit'
+        audit.mkdir(parents=True)
+        import todo_coord
+        con = todo_store.connect(audit / 'demo.sqlite')
+        todo_coord.role_set(con, 'demo #13', 'window')
+        con.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_post_then_list_unread(self):
+        r = run_cli('inbox', 'post', 'T-1 已推送待 tester #900', '--todo', 'T-1', '--by', 'demo #1｜實作',
+                    '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('demo #13', r.stdout)
+        self.assertNotIn('【彙整】', r.stdout)
+        r = run_cli('inbox', 'list', '--unread', '--project', 'demo', env_home=self.home)
+        self.assertIn('demo #1', r.stdout)
+        self.assertIn('T-1 已推送待 tester #900', r.stdout)
+
+    def test_post_empty_body_rejected(self):
+        r = run_cli('inbox', 'post', '  ', '--by', 'demo #1', '--project', 'demo', env_home=self.home)
+        self.assertEqual(r.returncode, 2)
+
+    def test_flush_instruction_printed_when_backlog_old(self):
+        import sqlite3
+        db = self.home / '.claude/todos/.audit/demo.sqlite'
+        run_cli('inbox', 'post', 'old', '--by', 'demo #1', '--project', 'demo', env_home=self.home)
+        con = sqlite3.connect(db)
+        con.execute("UPDATE coord_inbox SET created_at='2000-01-01T00:00:00'")
+        con.commit()
+        con.close()
+        r = run_cli('inbox', 'post', 'new', '--by', 'demo #3', '--project', 'demo', env_home=self.home)
+        self.assertIn('【彙整】', r.stdout)
+        self.assertIn('SendMessage', r.stdout)
+
+
 if __name__ == '__main__':
     unittest.main()

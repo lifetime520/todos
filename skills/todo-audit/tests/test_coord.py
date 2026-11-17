@@ -165,5 +165,83 @@ class TestSessions(_DB):
         self.assertFalse(f('/var/repos/tradingbot-other', '/var/repos/tradingbot'))
 
 
+
+class TestInbox(_DB):
+    """B 案（D-048）：peer 不需回應的回報寫收件匣，窗口被喚醒時才一次讀。"""
+
+    def setUp(self):
+        super().setUp()
+        todo_coord.role_set(self.con, 'tradingbot #13', 'window')
+
+    def test_post_defaults_to_window_and_take_marks_read(self):
+        r = todo_coord.inbox_post(self.con, '已推送待 tester #900', 'tradingbot #1｜實作', todo_ids='T-1')
+        self.assertEqual(r['to'], 'tradingbot #13')
+        items = todo_coord.inbox_take_unread(self.con, 'tradingbot #13｜窗口')
+        self.assertEqual([(i['from_name'], i['body'], i['todo_ids']) for i in items],
+                         [('tradingbot #1', '已推送待 tester #900', 'T-1')])
+        self.assertEqual(todo_coord.inbox_take_unread(self.con, 'tradingbot #13'), [])
+
+    def test_take_without_mark_keeps_unread_until_marked(self):
+        todo_coord.inbox_post(self.con, 'a', 'tradingbot #1')
+        items = todo_coord.inbox_take_unread(self.con, 'tradingbot #13', mark=False)
+        self.assertEqual(len(todo_coord.inbox_take_unread(self.con, 'tradingbot #13', mark=False)), 1)
+        todo_coord.inbox_mark_read(self.con, [i['id'] for i in items])
+        self.assertEqual(todo_coord.inbox_take_unread(self.con, 'tradingbot #13'), [])
+
+    def test_take_respects_char_budget_and_keeps_rest_unread(self):
+        for i in range(5):
+            todo_coord.inbox_post(self.con, f'{i}' + 'x' * 400, 'tradingbot #1')
+        first = todo_coord.inbox_take_unread(self.con, 'tradingbot #13', max_chars=1000)
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(todo_coord.inbox_take_unread(self.con, 'tradingbot #13')), 3)
+
+    def test_take_always_returns_at_least_one(self):
+        todo_coord.inbox_post(self.con, 'y' * 1500, 'tradingbot #1')
+        self.assertEqual(len(todo_coord.inbox_take_unread(self.con, 'tradingbot #13', max_chars=100)), 1)
+
+    def test_flush_only_when_backlog_old_and_not_recently_flushed(self):
+        t0 = '2026-11-17T10:00:00'
+        r = todo_coord.inbox_post(self.con, 'a', 'tradingbot #1', now=t0)
+        self.assertFalse(r['flush'])
+        r = todo_coord.inbox_post(self.con, 'b', 'tradingbot #3', now='2026-11-17T10:59:00')
+        self.assertFalse(r['flush'])
+        r = todo_coord.inbox_post(self.con, 'c', 'tradingbot #3', now='2026-11-17T11:01:00')
+        self.assertTrue(r['flush'])
+        self.assertEqual((r['unread'], r['oldest_min']), (3, 61))
+        r = todo_coord.inbox_post(self.con, 'd', 'tradingbot #4', now='2026-11-17T11:30:00')
+        self.assertFalse(r['flush'])  # 60 分鐘內已彙整過
+        r = todo_coord.inbox_post(self.con, 'e', 'tradingbot #4', now='2026-11-17T12:02:00')
+        self.assertTrue(r['flush'])
+
+    def test_no_window_raises(self):
+        self.con.execute('DELETE FROM coord_role')
+        with self.assertRaises(ValueError):
+            todo_coord.inbox_post(self.con, 'a', 'tradingbot #1')
+
+    def test_overlong_body_raises(self):
+        with self.assertRaises(ValueError):
+            todo_coord.inbox_post(self.con, 'x' * (todo_coord.INBOX_MAX_CHARS + 1), 'tradingbot #1')
+
+    def test_empty_body_raises(self):
+        with self.assertRaises(ValueError):
+            todo_coord.inbox_post(self.con, '  ', 'tradingbot #1')
+
+
+class TestResolveTarget(_DB):
+    def test_name_forms(self):
+        for to in ('tradingbot #13', 'tradingbot #13｜窗口', 'tradingbot #13 [3fa9c1]',
+                   'tradingbot #13｜窗口 [3fa9c1]'):
+            self.assertEqual(todo_coord.resolve_target(to, self.sess), 'tradingbot #13', to)
+
+    def test_uds_address_via_sessions(self):
+        self._session(os.getpid(), 'tradingbot #13｜窗口', 'sid-w')
+        to = f'uds:/run/user/1000/cc-socks/{os.getpid()}.sock'
+        self.assertEqual(todo_coord.resolve_target(to, self.sess), 'tradingbot #13')
+
+    def test_unknown_uds_none(self):
+        self.assertIsNone(todo_coord.resolve_target('uds:/x/999999.sock', self.sess))
+        self.assertIsNone(todo_coord.resolve_target('', self.sess))
+
+
 if __name__ == '__main__':
     unittest.main()

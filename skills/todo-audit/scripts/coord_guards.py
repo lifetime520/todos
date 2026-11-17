@@ -101,3 +101,54 @@ def design_docs_guard(tool_name, text, project_root, review_label=''):
             'S9b 第 4 次被糾正後才第一次讀這份文件。'
             '派給審查者時，把文件路徑列入必讀，不要只當背景。'),
     }
+
+
+# ---------------------------------------------------------------- 收件匣分流（B 案，D-048）
+
+PEER_TAGS = ('問題', '阻塞', '交付', '轉達', '彙整', '緊急')
+# 標籤可帶編號或前後綴（【交付 T-1021】、【T-1021 交付】、[交付]），只要出現在開頭 30 字內
+PEER_TAG_RE = re.compile(r'[【\[][^】\]]{0,20}?(' + '|'.join(PEER_TAGS) + r')[^】\]]{0,20}[】\]]')
+PEER_TAG_WINDOW = 30
+# 純確認：拿掉開頭標籤、確認詞、標點與表情後幾乎不剩字
+ACK_WORDS_RE = re.compile(r'收到|了解|知悉|好的|好|謝謝|感謝|\bok\b|👍|🙏', re.I)
+ACK_LEFTOVER_MAX = 0
+
+
+def _is_pure_ack(msg):
+    body = re.sub(r'^\s*[【\[][^】\]]*[】\]]', '', msg or '')
+    if '？' in body or '?' in body:
+        return False
+    rest = re.sub(r'[\W_～~]+', '', ACK_WORDS_RE.sub('', body))
+    return body.strip() != '' and len(rest) <= ACK_LEFTOVER_MAX and bool(ACK_WORDS_RE.search(body))
+
+
+def peer_message_guard(sender, target, window, message):
+    """sender／target／window 皆為 session 短名（解析不到為 None）。回傳 PreToolUse 片段或 None。"""
+    if not window:
+        return None
+    if sender == window:
+        if target and target != window and _is_pure_ack(message):
+            return {'permissionDecision': 'deny', 'permissionDecisionReason': (
+                '【窗口不回純確認】只回「收到／了解」會再喚醒對方一次、整份 context 重讀'
+                '（D-048：#13 實測只回收到的段占 13% 成本）。沒有裁示或指示就不用回；'
+                '要回就附上實質內容。')}
+        return None
+    if target != window or PEER_TAG_RE.search((message or '')[:PEER_TAG_WINDOW]):
+        return None
+    return {'permissionDecision': 'deny', 'permissionDecisionReason': (
+        f'【送窗口的訊息要帶標籤】需要 {window} 回應或處理的，開頭加上'
+        f'{"／".join("【" + t + "】" for t in PEER_TAGS)}其中之一再送。'
+        '不需要回應的（進度、已照辦、已推送待 tester、PASS 通知）改寫收件匣，窗口下次醒來會一次看到：'
+        'python3 ~/.claude/skills/todo-audit/scripts/todo_cli.py inbox post "<內容>" --todo T-NNN'
+        '（D-048：#13 實測讀完沒回＋只回收到的喚醒占 31% 成本）。')}
+
+
+def inbox_inject_text(items):
+    if not items:
+        return None
+    lines = [f'【收件匣 {len(items)} 則（peer 不需回應的回報，送出後標為已讀）】']
+    for i in items:
+        tid = f'（{i["todo_ids"]}）' if i.get('todo_ids') else ''
+        lines.append(f'- {i["created_at"][11:16]} {i["from_name"] or "?"}{tid}：{i["body"]}')
+    lines.append('有需要處理的照常處理；純知會不必回覆（窗口不回純確認）。')
+    return '\n'.join(lines)

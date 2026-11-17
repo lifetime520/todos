@@ -101,6 +101,11 @@ CREATE TABLE IF NOT EXISTS coord_owner(
 CREATE TABLE IF NOT EXISTS coord_decision(
   id TEXT PRIMARY KEY, decided_at TEXT, topic TEXT NOT NULL, cast_quote TEXT NOT NULL,
   summary TEXT, supersedes TEXT, asked_by TEXT, status TEXT NOT NULL DEFAULT 'active');
+CREATE TABLE IF NOT EXISTS coord_inbox(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, to_name TEXT NOT NULL, from_name TEXT,
+  body TEXT NOT NULL, todo_ids TEXT, created_at TEXT NOT NULL, read_at TEXT);
+CREATE INDEX IF NOT EXISTS ix_inbox_unread ON coord_inbox(to_name, read_at);
+CREATE TABLE IF NOT EXISTS coord_inbox_flush(to_name TEXT PRIMARY KEY, flushed_at TEXT);
 """
 
 

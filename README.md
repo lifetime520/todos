@@ -106,13 +106,20 @@ mkdir -p ~/.claude/docs
 ln -sfn "$REPO/docs/TODO-SYSTEM.md" ~/.claude/docs/TODO-SYSTEM.md
 ```
 
-接著在 `~/.claude/settings.json` 註冊三個 hook：
+接著在 `~/.claude/settings.json` 註冊 hook（待辦系統必要的是前三個；其餘是多 session 協作守衛，可選）：
 
 | 事件 | 指令 |
 |---|---|
 | `SessionStart` | `bash ~/.claude/hooks/todo-startup.sh` |
 | `Stop` | `bash ~/.claude/hooks/todo-reminder.sh` |
-| `PreToolUse` | `bash ~/.claude/hooks/todo-guard.sh` |
+| `PreToolUse`（Read\|Grep\|Glob\|Bash） | `bash ~/.claude/hooks/todo-guard.sh` |
+| `Stop` | `bash ~/.claude/hooks/stop-guards.sh`（未來式承諾沒提問擋一次、長壽子程序盤點；D-047） |
+| `UserPromptSubmit` | `bash ~/.claude/hooks/window-context-guard.sh`、`bash ~/.claude/hooks/window-inbox.sh`（窗口收件匣注入；D-048） |
+| `PreToolUse`（AskUserQuestion） | `bash ~/.claude/hooks/ask-window-guard.sh` |
+| `PreToolUse`（Agent\|SendMessage） | `bash ~/.claude/hooks/design-docs-guard.sh` |
+| `PreToolUse`（SendMessage） | `bash ~/.claude/hooks/peer-message-guard.sh`（送窗口要帶標籤；D-048） |
+
+`window-inbox.sh` 必須先於 `peer-message-guard.sh` 註冊：守衛會把 peer 的回報導進收件匣，沒有注入端就沒人讀。
 
 ## 使用
 

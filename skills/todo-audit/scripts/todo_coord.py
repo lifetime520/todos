@@ -223,6 +223,103 @@ def orphan_claims(con, ws_root=None):
     return out
 
 
+# ---------------------------------------------------------------- 收件匣（B 案，D-048）
+
+# peer 不需窗口回應的回報（進度、已照辦、PASS 通知）寫這裡，窗口被任何理由喚醒時
+# 由 window-inbox.sh 一次注入。實測（#13 transcript 11-06～11-16）：153 段 peer 喚醒中
+# 「讀完沒回」＋「只回收到」占 31% cache read。積壓超過這個分鐘數、且這段時間內沒彙整過，
+# 下一則 post 會要求寄件者另送一則【彙整】喚醒窗口（系統排程無法送 SendMessage）。
+INBOX_FLUSH_MIN = 60
+INBOX_MAX_CHARS = 2000  # 單則上限；長內容寫檔後附路徑
+_TS = '%Y-%m-%dT%H:%M:%S'
+
+
+def _minutes(a, b):
+    return int((datetime.strptime(b, _TS) - datetime.strptime(a, _TS)).total_seconds() // 60)
+
+
+def inbox_post(con, body, frm, to=None, todo_ids=None, now=None):
+    body = (body or '').strip()
+    if not body:
+        raise ValueError('內容不得為空')
+    if len(body) > INBOX_MAX_CHARS:
+        raise ValueError(f'內容 {len(body)} 字，超過單則上限 {INBOX_MAX_CHARS} 字；長內容請寫檔後附路徑')
+    to = short_name(to) if to else window_name(con)
+    if not to:
+        raise ValueError('未設定窗口 session，請以 --to 指定收件者')
+    now = now or _now()
+    con.execute('INSERT INTO coord_inbox(to_name, from_name, body, todo_ids, created_at)'
+                ' VALUES(?,?,?,?,?)', (to, short_name(frm) or None, body, todo_ids, now))
+    unread, oldest = con.execute('SELECT COUNT(*), MIN(created_at) FROM coord_inbox'
+                                 ' WHERE to_name=? AND read_at IS NULL', (to,)).fetchone()
+    last = con.execute('SELECT flushed_at FROM coord_inbox_flush WHERE to_name=?', (to,)).fetchone()
+    oldest_min = _minutes(oldest, now)
+    flush = (oldest_min >= INBOX_FLUSH_MIN
+             and (not last or _minutes(last[0], now) >= INBOX_FLUSH_MIN))
+    if flush:
+        con.execute('INSERT OR REPLACE INTO coord_inbox_flush VALUES(?,?)', (to, now))
+    con.commit()
+    return {'to': to, 'unread': unread, 'oldest_min': oldest_min, 'flush': flush}
+
+
+_INBOX_KEYS = ('id', 'from_name', 'body', 'todo_ids', 'created_at')
+
+
+def inbox_take_unread(con, to, max_chars=3000, mark=True):
+    """取未讀（舊到新），總字數不超過 max_chars（至少一則）。mark=True 時取到的標為已讀；
+    hook 用 mark=False，先印出注入內容再呼叫 inbox_mark_read，被中斷時寧可重複注入也不遺失。"""
+    rows = con.execute(f'SELECT {", ".join(_INBOX_KEYS)} FROM coord_inbox'
+                       ' WHERE to_name=? AND read_at IS NULL ORDER BY id',
+                       (short_name(to),)).fetchall()
+    out, used = [], 0
+    for r in rows:
+        if out and used + len(r[2]) > max_chars:
+            break
+        out.append(dict(zip(_INBOX_KEYS, r)))
+        used += len(r[2])
+    if out and mark:
+        inbox_mark_read(con, [i['id'] for i in out])
+    return out
+
+
+def inbox_mark_read(con, ids):
+    con.executemany('UPDATE coord_inbox SET read_at=? WHERE id=? AND read_at IS NULL',
+                    [(_now(), i) for i in ids])
+    con.commit()
+
+
+def inbox_list(con, to=None, unread_only=False, limit=50):
+    q = f'SELECT {", ".join(_INBOX_KEYS)}, to_name, read_at FROM coord_inbox WHERE 1=1'
+    args = []
+    if to:
+        q += ' AND to_name=?'
+        args.append(short_name(to))
+    if unread_only:
+        q += ' AND read_at IS NULL'
+    q += ' ORDER BY id DESC LIMIT ?'
+    args.append(limit)
+    return [dict(zip(_INBOX_KEYS + ('to_name', 'read_at'), r)) for r in con.execute(q, args)]
+
+
+_UDS_PID_RE = re.compile(r'^uds:.*/(\d+)\.sock$')
+_REF_RE = re.compile(r'\s*\[[^\]]*\]\s*$')
+
+
+def resolve_target(to, sessions_dir=None):
+    """SendMessage 的 to（名稱、帶 [ref] 的名稱、uds 位址）→ session 短名；解析不到回 None。"""
+    to = (to or '').strip()
+    if not to:
+        return None
+    m = _UDS_PID_RE.match(to)
+    if m:
+        f = Path(sessions_dir or SESSIONS_DIR) / f'{m.group(1)}.json'
+        try:
+            return short_name(json.loads(f.read_text()).get('name')) or None
+        except (OSError, ValueError, AttributeError):
+            return None
+    return short_name(_REF_RE.sub('', to)) or None
+
+
 # ---------------------------------------------------------------- 裁決
 
 _DEC_KEYS = ('id', 'decided_at', 'topic', 'cast_quote', 'summary',

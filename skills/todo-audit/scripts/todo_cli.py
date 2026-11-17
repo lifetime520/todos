@@ -569,6 +569,32 @@ def cmd_orphans(con, args):
     return 0
 
 
+def cmd_inbox(con, args):
+    if args.action == 'post':
+        try:
+            r = todo_coord.inbox_post(con, args.text, _me(args), to=args.to, todo_ids=args.todo)
+        except ValueError as e:
+            print(f'❌ {e}', file=sys.stderr)
+            return 2
+        print(f'已寫入收件匣 → {r["to"]}（未讀 {r["unread"]} 則，最舊 {r["oldest_min"]} 分鐘）。'
+              '窗口下次被喚醒時會一次看到，不需要另外通知。')
+        if r['flush']:
+            print(f'⚠ 收件匣積壓已超過 {todo_coord.INBOX_FLUSH_MIN} 分鐘，請另外 SendMessage 給 {r["to"]} 一則：'
+                  f'「【彙整】收件匣有 {r["unread"]} 則未讀，最舊 {r["oldest_min"]} 分鐘。」'
+                  '（不必附內容，窗口醒來會自動看到全部）')
+        return 0
+    rows = todo_coord.inbox_list(con, to=args.to, unread_only=args.unread, limit=args.limit)
+    if not rows:
+        print('收件匣沒有符合的條目。')
+        return 0
+    for r in rows:
+        state = '未讀' if not r['read_at'] else f'已讀 {r["read_at"]}'
+        tid = f'（{r["todo_ids"]}）' if r['todo_ids'] else ''
+        print(f'#{r["id"]}  {r["created_at"]}  {r["from_name"] or "?"} → {r["to_name"]}{tid}  [{state}]')
+        print(f'    {r["body"]}')
+    return 0
+
+
 def cmd_decision(con, args):
     if args.action == 'add':
         if not args.topic or not args.quote:
@@ -906,6 +932,17 @@ def main():
     p = sub.add_parser('orphans', parents=[common],
                        help='孤兒認領：doing 但認領的工作區已不存在（只列出、不改狀態）')
     p.set_defaults(fn=cmd_orphans)
+
+    p = sub.add_parser('inbox', parents=[common],
+                       help='收件匣：不需窗口回應的回報（D-048）；post 寫入、list 查看')
+    p.add_argument('action', choices=['post', 'list'])
+    p.add_argument('text', nargs='?', default='', help='post：內容')
+    p.add_argument('--to', help='收件者（預設窗口）')
+    p.add_argument('--todo', help='相關待辦，如 T-1021')
+    p.add_argument('--by', help='寄件者（預設自動取本 session 名稱）')
+    p.add_argument('--unread', action='store_true', help='list：只列未讀')
+    p.add_argument('--limit', type=int, default=30)
+    p.set_defaults(fn=cmd_inbox)
 
     p = sub.add_parser('decision', parents=[common], help='Cast 裁決紀錄')
     p.add_argument('action', choices=['add', 'list', 'match'])

@@ -131,6 +131,61 @@ class TestDesignDocs(unittest.TestCase):
         self.assertNotEqual(out.get('permissionDecision'), 'deny')
 
 
+class TestPeerMessageGuard(unittest.TestCase):
+    """B 案（D-048）：peer 送窗口要帶標籤；窗口不回純確認。"""
+    W = 'tradingbot #13'
+
+    def test_untagged_peer_to_window_denied_with_inbox_hint(self):
+        out = g.peer_message_guard('tradingbot #1', self.W, self.W, 'T-1 已推送，等 tester #900。')
+        self.assertEqual(out['permissionDecision'], 'deny')
+        self.assertIn('inbox post', out['permissionDecisionReason'])
+
+    def test_tagged_peer_to_window_allowed(self):
+        for tag in ('問題', '阻塞', '交付', '轉達', '彙整', '緊急'):
+            self.assertIsNone(g.peer_message_guard('tradingbot #1', self.W, self.W, f'  【{tag}】T-1 …'), tag)
+
+    def test_tag_variants_allowed(self):
+        for m in ('【交付 T-1021】PASS', '【T-1021 交付】x', '#3：【交付】x', '** 【問題】x', '[交付] x'):
+            self.assertIsNone(g.peer_message_guard('tradingbot #1', self.W, self.W, m), m)
+
+    def test_tag_late_in_text_not_counted(self):
+        m = 'T-1 已推送，等 tester #900，之後如果有' + '【問題】' + '再說'
+        self.assertIsNotNone(g.peer_message_guard('tradingbot #1', self.W, self.W, m))
+
+    def test_peer_to_non_window_allowed(self):
+        self.assertIsNone(g.peer_message_guard('tradingbot #1', 'tradingbot #3', self.W, '隨便'))
+        self.assertIsNone(g.peer_message_guard('tradingbot #1', None, self.W, '隨便'))
+
+    def test_no_window_configured_allowed(self):
+        self.assertIsNone(g.peer_message_guard('tradingbot #1', self.W, None, '隨便'))
+
+    def test_window_pure_ack_denied(self):
+        for m in ('收到', '【#13】收到，謝謝。', '了解 👍', 'OK，知悉', 'ok!', '好的～'):
+            out = g.peer_message_guard(self.W, 'tradingbot #1', self.W, m)
+            self.assertEqual(out['permissionDecision'], 'deny', m)
+
+    def test_window_substantive_reply_allowed(self):
+        for m in ('token 已換新', '收到，T-1021 我這邊接手', '收到，T-1021 已部署完成 PASS', 'OK 已 merge',
+                  '不好', '好，停', '好，等', '收到，改', '好，可', '了解，否', '好？', 'OK?', '收到？','收到，採 (a)。', '【#13 裁示 T-1016】採 (a)，附三點：…', '收到，請先改測試再送 tester。',
+                  '收到。' + '說明' * 40, '了解，你那邊卡在哪？'):
+            self.assertIsNone(g.peer_message_guard(self.W, 'tradingbot #1', self.W, m), m)
+
+
+class TestInboxInject(unittest.TestCase):
+    def test_format(self):
+        items = [{'id': 1, 'from_name': 'tradingbot #1', 'body': 'A', 'todo_ids': 'T-1',
+                  'created_at': '2026-11-17T10:00:00'},
+                 {'id': 2, 'from_name': 'tradingbot #3', 'body': 'B', 'todo_ids': None,
+                  'created_at': '2026-11-17T10:05:00'}]
+        t = g.inbox_inject_text(items)
+        self.assertIn('收件匣 2 則', t)
+        self.assertIn('10:00 tradingbot #1（T-1）：A', t)
+        self.assertIn('10:05 tradingbot #3：B', t)
+
+    def test_empty_none(self):
+        self.assertIsNone(g.inbox_inject_text([]))
+
+
 class TestHooksEndToEnd(unittest.TestCase):
     """直接跑 hooks/*.sh，HOME 指向假家目錄、skill 連回本 checkout。"""
     REPO = Path(__file__).resolve().parents[3]
@@ -192,9 +247,31 @@ class TestHooksEndToEnd(unittest.TestCase):
         self.assertIsNone(self._run('window-context-guard.sh',
                                     {'session_id': 'sid-imp', 'transcript_path': str(t)}))
 
+    def test_peer_message_guard_hook(self):
+        deny = self._run('peer-message-guard.sh', {'session_id': 'sid-imp', 'tool_name': 'SendMessage',
+                         'tool_input': {'to': 'demo #13', 'message': 'T-1 已推送'}})
+        self.assertEqual(deny['permissionDecision'], 'deny')
+        self.assertIsNone(self._run('peer-message-guard.sh', {'session_id': 'sid-imp', 'tool_name': 'SendMessage',
+                          'tool_input': {'to': 'demo #13｜窗口', 'message': '【問題】T-1 選哪個？'}}))
+        ack = self._run('peer-message-guard.sh', {'session_id': 'sid-win', 'tool_name': 'SendMessage',
+                        'tool_input': {'to': 'demo #1', 'message': '收到'}})
+        self.assertEqual(ack['permissionDecision'], 'deny')
+
+    def test_window_inbox_hook_injects_once(self):
+        import todo_store, todo_coord
+        con = todo_store.connect(self.home / '.claude/todos/.audit/demo.sqlite')
+        todo_coord.inbox_post(con, '已推送待 tester', 'demo #1', todo_ids='T-9')
+        con.close()
+        imp = self._run('window-inbox.sh', {'session_id': 'sid-imp'})
+        self.assertIsNone(imp)  # 非窗口不注入、也不標已讀
+        out = self._run('window-inbox.sh', {'session_id': 'sid-win'})
+        self.assertIn('已推送待 tester', out['additionalContext'])
+        self.assertIsNone(self._run('window-inbox.sh', {'session_id': 'sid-win'}))
+
     def test_hooks_fail_open_on_garbage_input(self):
         import subprocess
-        for hook in ('ask-window-guard.sh', 'window-context-guard.sh', 'design-docs-guard.sh'):
+        for hook in ('ask-window-guard.sh', 'window-context-guard.sh', 'design-docs-guard.sh',
+                     'peer-message-guard.sh', 'window-inbox.sh'):
             r = subprocess.run(['bash', str(self.REPO / 'hooks' / hook)], cwd=self.proj,
                                input='not json{', capture_output=True, text=True, env=self.env)
             self.assertEqual((r.returncode, r.stdout.strip()), (0, ''), hook)
