@@ -555,17 +555,27 @@ def cmd_owner(con, args):
 
 
 def cmd_orphans(con, args):
-    rows = todo_coord.orphan_claims(con)
-    if not rows:
-        print('沒有孤兒認領（doing 且認領的工作區都還在）。')
+    orphans = todo_coord.orphan_claims(con)
+    stale = todo_coord.stale_claims(con)
+    if not orphans and not stale:
+        print(f'沒有可疑認領（doing 的工作區都在，且 {todo_coord.STALE_DAYS} 天內都有活動）。')
         return 0
-    print(f'孤兒認領 {len(rows)} 條：認領者是 ws:<名稱>，但 {todo_coord.WS_ROOT} 下已無該工作區。')
-    print('不一定是遺棄 —— 可能是實作完、等部署後驗收。看最後活動時間判斷；'
-          '確定沒人在做就 mark <T> pending --by <原認領者>。')
-    for r in rows:
+    if orphans:
+        print(f'孤兒認領 {len(orphans)} 條：認領者是 ws:<名稱>，但 {todo_coord.WS_ROOT} 下已無該工作區。')
+    for r in orphans:
         print(f'  {r["short_id"]}  {r["by"]}  認領 {r["claimed_at"]}'
               f'  最後活動 {r["last_activity"]}（{todo_store.humanize_age(r["last_activity"])}）'
               f'  {r["title"]}')
+    if stale:
+        print(f'停滯認領 {len(stale)} 條：{todo_coord.STALE_DAYS} 天內沒有狀態變更、note、'
+              '工作區 commit 或未提交修改。')
+    for r in stale:
+        print(f'  {r["short_id"]}  {r["by"]}  認領 {r["claimed_at"]}'
+              f'  最後活動 {r["last_activity"]}（{todo_store.humanize_age(r["last_activity"])}）'
+              f'  {r["title"]}')
+    print('不一定是遺棄 —— 可能在等部署後驗收或外部環境。逐條判斷：')
+    print('  沒人在做 → mark <T> pending --by <原認領者> --note "釋放理由"')
+    print('  等的環境已不存在（例：testnet 停擺、key 停用）→ 重評驗收條件，改寫條目或拆出後置驗收條目後釋放')
     return 0
 
 
@@ -930,7 +940,7 @@ def main():
     p.set_defaults(fn=cmd_owner)
 
     p = sub.add_parser('orphans', parents=[common],
-                       help='孤兒認領：doing 但認領的工作區已不存在（只列出、不改狀態）')
+                       help='可疑認領：工作區已不存在，或 7 天無活動（只列出、不改狀態）')
     p.set_defaults(fn=cmd_orphans)
 
     p = sub.add_parser('inbox', parents=[common],

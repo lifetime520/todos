@@ -11,7 +11,8 @@
 import json
 import os
 import re
-from datetime import datetime
+import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 
 SESSIONS_DIR = Path.home() / '.claude' / 'sessions'
@@ -191,14 +192,20 @@ def owner_prune(con, dry_run=False):
 WS_ROOT = Path(os.environ.get('TODO_WS_ROOT') or Path.home() / 'WorkSpace' / 'ws')
 
 
-def _ws_exists(root, name, project=None):
+def _ws_path(root, name, project=None):
     """session-ws 的工作區目錄是 <專案>-<名稱>。知道專案就精確比對；不知道才退回
-    後綴比對（會把 ws:t2 誤認成 tradingbot-coinm-t2 —— 寧可少報孤兒，不誤報）。"""
+    後綴比對（會把 ws:t2 誤認成 tradingbot-coinm-t2 —— 寧可少報孤兒，不誤報）。
+    找不到回 None。"""
     if (root / name).is_dir():
-        return True
+        return root / name
     if project:
-        return (root / f'{project}-{name}').is_dir()
-    return any(p.is_dir() for p in root.glob(f'*-{name}'))
+        p = root / f'{project}-{name}'
+        return p if p.is_dir() else None
+    return next((p for p in sorted(root.glob(f'*-{name}')) if p.is_dir()), None)
+
+
+def _ws_exists(root, name, project=None):
+    return _ws_path(root, name, project) is not None
 
 
 def orphan_claims(con, ws_root=None):
@@ -221,6 +228,87 @@ def orphan_claims(con, ws_root=None):
         out.append({'short_id': sid, 'title': title, 'by': by, 'claimed_at': at,
                     'last_activity': max(filter(None, (last, at)), default=None)})
     return out
+
+
+# ---------------------------------------------------------------- 停滯認領（D-086）
+
+# T-824 卡 doing 25 天、T-799 卡 38 天：工作區都在、都乾淨、分支早已合入，認領純屬殘留。
+# 孤兒偵測只看「工作區在不在」抓不到這種。這裡改看「最後一次有人碰它」：
+# DB 事件（狀態變更、note）、工作區 HEAD commit 時間、未提交檔案的修改時間，取最晚者。
+STALE_DAYS = 7
+_GIT_TIMEOUT_S = 3
+
+
+def _ws_last_activity(path):
+    """工作區最後活動時間（本地時間 ISO 字串）；讀不到回 None —— 呼叫端只拿它和
+    DB 事件取最大值，讀不到等於不加分，不會讓條目被誤判為停滯以外的狀態。"""
+    times = []
+    try:
+        r = subprocess.run(['git', '-C', str(path), 'log', '-1', '--format=%ct', 'HEAD'],
+                           capture_output=True, text=True, timeout=_GIT_TIMEOUT_S)
+        if r.returncode == 0 and r.stdout.strip():
+            times.append(int(r.stdout.strip()))
+        # --no-optional-locks：不順手寫回 index，免得和正在用這個工作區的 session 搶 index.lock
+        r = subprocess.run(['git', '-C', str(path), '--no-optional-locks', 'status', '--porcelain', '-z',
+                            '--untracked-files=normal'],
+                           capture_output=True, text=True, timeout=_GIT_TIMEOUT_S)
+        if r.returncode == 0:
+            for ent in r.stdout.split('\0'):
+                if len(ent) > 3:
+                    try:
+                        times.append(int((Path(path) / ent[3:]).stat().st_mtime))
+                    except OSError:
+                        pass  # 已刪除的檔沒有 mtime
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    if not times:
+        return None
+    return datetime.fromtimestamp(max(times)).strftime('%Y-%m-%dT%H:%M:%S')
+
+
+def stale_claims(con, ws_root=None, stale_days=STALE_DAYS, now=None):
+    """doing 且「最後活動」超過 stale_days 天的認領（工作區已不存在的歸 orphan_claims，
+    這裡不重複列）。只列出、不改狀態：卡住的原因可能是等外部環境（D-086 實例：
+    後置驗收依賴已停擺的 testnet），該重評還是該釋放要人判斷。"""
+    root = Path(ws_root or WS_ROOT)
+    pp = project_path_of(con)
+    project = Path(pp).name if pp else None
+    cutoff = ((now or datetime.now()) - timedelta(days=stale_days)).strftime('%Y-%m-%dT%H:%M:%S')
+    out = []
+    for key, sid, title, by, at in con.execute(
+            "SELECT key, short_id, title, status_by, status_at FROM todo"
+            " WHERE status='doing' ORDER BY sort_order").fetchall():
+        if at and at > cutoff:
+            continue  # 快路徑：最近才認領，不必碰 git
+        last = con.execute('SELECT MAX(at) FROM todo_event WHERE todo_key=?', (key,)).fetchone()[0]
+        ws = None
+        if by and by.startswith('ws:') and root.is_dir():
+            ws = _ws_path(root, by[3:], project)
+            if ws is None:
+                continue  # 工作區不存在 → 孤兒，由 orphan_claims 負責
+        ws_last = _ws_last_activity(ws) if ws else None
+        activity = max(filter(None, (at, last, ws_last)), default=None)
+        if activity and activity > cutoff:
+            continue
+        out.append({'short_id': sid, 'title': title, 'by': by, 'claimed_at': at,
+                    'last_activity': activity})
+    return out
+
+
+def suspect_claims_line(con, ws_root=None):
+    """看板／窗口提示共用的一行摘要；沒有可疑認領回 None。"""
+    parts = []
+    orphans = orphan_claims(con, ws_root)
+    stale = stale_claims(con, ws_root)
+    def ids(rows):
+        return '、'.join(r['short_id'] for r in rows[:6]) + ('…' if len(rows) > 6 else '')
+    if orphans:
+        parts.append(f'孤兒 {len(orphans)} 條（工作區已不存在）：{ids(orphans)}')
+    if stale:
+        parts.append(f'停滯 {len(stale)} 條（{STALE_DAYS} 天無活動）：{ids(stale)}')
+    if not parts:
+        return None
+    return '⚠ 可疑認領 ' + '；'.join(parts) + '（todo_cli.py orphans 看明細）'
 
 
 # ---------------------------------------------------------------- 收件匣（B 案，D-048）
@@ -493,11 +581,9 @@ def board_text(con, sessions_dir=None, max_chars=600):
         if r['warn']:
             line += f' ⚠ {r["warn"]}'
         lines.append(line)
-    orphans = orphan_claims(con)
-    if orphans:  # 放在標題後：看板超長會從尾端截斷
-        lines.insert(1, f'⚠ 孤兒認領 {len(orphans)} 條（工作區已不存在）：'
-                     + '、'.join(o['short_id'] for o in orphans[:6])
-                     + ('…' if len(orphans) > 6 else '') + '（todo_cli.py orphans）')
+    suspect = suspect_claims_line(con)
+    if suspect:  # 放在標題後：看板超長會從尾端截斷
+        lines.insert(1, suspect)
     text = '\n'.join(lines)
     if len(text) > max_chars:
         text = text[:max_chars - 1] + '…'

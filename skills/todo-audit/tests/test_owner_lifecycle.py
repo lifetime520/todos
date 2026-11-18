@@ -190,6 +190,116 @@ class TestOrphanClaims(_DB):
 
 
 
+class TestStaleClaims(_DB):
+    """D-086：T-824／T-799 工作區都在、乾淨、已合入，卻卡 doing 25／38 天。"""
+    OLD = '2026-01-01T00:00:00'
+
+    def setUp(self):
+        super().setUp()
+        self.ws = Path(self.tmp.name) / 'ws'
+        self.ws.mkdir()
+        self.con.execute("INSERT OR REPLACE INTO doc_meta(project, k, v)"
+                         " VALUES('p', 'project_path', '/var/repos/tradingbot')")
+        self.con.commit()
+
+    def _git_ws(self, name, commit_at=None):
+        import os, subprocess
+        d = self.ws / f'tradingbot-{name}'
+        d.mkdir()
+        env = dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@t', GIT_COMMITTER_NAME='t',
+                   GIT_COMMITTER_EMAIL='t@t')
+        if commit_at:
+            env['GIT_COMMITTER_DATE'] = env['GIT_AUTHOR_DATE'] = commit_at
+        subprocess.run(['git', 'init', '-q', str(d)], check=True, env=env)
+        (d / 'a.txt').write_text('a')
+        subprocess.run(['git', '-C', str(d), 'add', '.'], check=True, env=env)
+        subprocess.run(['git', '-C', str(d), 'commit', '-qm', 'x'], check=True, env=env)
+        return d
+
+    def _claim_old(self, title, by):
+        k, s = self._add(title)
+        todo_store.set_status(self.con, k, 'doing', by=by)
+        self.con.execute('UPDATE todo SET status_at=? WHERE key=?', (self.OLD, k))
+        self.con.execute('UPDATE todo_event SET at=? WHERE todo_key=?', (self.OLD, k))
+        self.con.commit()
+        return k, s
+
+    def _stale_ids(self):
+        return [r['short_id'] for r in todo_coord.stale_claims(self.con, ws_root=self.ws)]
+
+    def test_clean_old_workspace_is_stale(self):
+        self._git_ws('spec2', commit_at='2026-01-01T00:00:00')
+        _, s = self._claim_old('殘留', 'ws:spec2')
+        self.assertEqual(self._stale_ids(), [s])
+
+    def test_recent_commit_in_workspace_keeps_claim_alive(self):
+        self._git_ws('busy')  # commit 時間＝現在
+        self._claim_old('還在做', 'ws:busy')
+        self.assertEqual(self._stale_ids(), [])
+
+    def test_recent_uncommitted_edit_keeps_claim_alive(self):
+        d = self._git_ws('dirty', commit_at='2026-01-01T00:00:00')
+        (d / 'a.txt').write_text('改了還沒 commit')
+        self._claim_old('改到一半', 'ws:dirty')
+        self.assertEqual(self._stale_ids(), [])
+
+    def test_recent_note_keeps_claim_alive(self):
+        self._git_ws('waiting', commit_at='2026-01-01T00:00:00')
+        k, _ = self._claim_old('等驗收', 'ws:waiting')
+        todo_store.append_note(self.con, k, '🔍  今天複驗')
+        self.assertEqual(self._stale_ids(), [])
+
+    def test_recent_claim_skips_git(self):
+        k, _ = self._add('剛認領')
+        todo_store.set_status(self.con, k, 'doing', by='ws:nowhere-but-new')
+        self.assertEqual(self._stale_ids(), [])
+
+    def test_missing_workspace_is_orphan_not_stale(self):
+        self._claim_old('孤兒', 'ws:gone')
+        self.assertEqual(self._stale_ids(), [])
+        self.assertEqual(len(todo_coord.orphan_claims(self.con, ws_root=self.ws)), 1)
+
+    def test_non_workspace_claim_judged_by_db_activity(self):
+        _, s = self._claim_old('session 名認領', 'tradingbot #3')
+        self.assertEqual(self._stale_ids(), [s])
+
+    def test_board_line_lists_both_kinds(self):
+        self._git_ws('spec2', commit_at='2026-01-01T00:00:00')
+        _, s1 = self._claim_old('殘留', 'ws:spec2')
+        _, s2 = self._claim_old('孤兒', 'ws:gone')
+        line = todo_coord.suspect_claims_line(self.con, ws_root=self.ws)
+        self.assertIn(f'孤兒 1 條（工作區已不存在）：{s2}', line)
+        self.assertIn(f'停滯 1 條（7 天無活動）：{s1}', line)
+
+    def test_window_reminder_throttled_24h(self):
+        import coord_guards
+        self._claim_old('殘留', 'tradingbot #3')
+        t0 = datetime(2026, 11, 18, 22, 0, 0)
+        self.assertIn('停滯 1 條', coord_guards.suspect_claims_reminder(self.con, now=t0, ws_root=self.ws))
+        self.assertIsNone(coord_guards.suspect_claims_reminder(
+            self.con, now=t0 + timedelta(hours=23), ws_root=self.ws))
+        self.assertIsNotNone(coord_guards.suspect_claims_reminder(
+            self.con, now=t0 + timedelta(hours=25), ws_root=self.ws))
+
+    def test_window_reminder_skips_scan_inside_throttle(self):
+        """審查發現：節流放在掃描之後，窗口每次被喚醒都白跑一次 git 掃描。"""
+        import coord_guards
+        self._claim_old('殘留', 'tradingbot #3')
+        t0 = datetime(2026, 11, 18, 22, 0, 0)
+        coord_guards.suspect_claims_reminder(self.con, now=t0, ws_root=self.ws)
+        orig, calls = todo_coord.suspect_claims_line, []
+        todo_coord.suspect_claims_line = lambda *a, **k: calls.append(1)
+        try:
+            coord_guards.suspect_claims_reminder(self.con, now=t0 + timedelta(hours=1), ws_root=self.ws)
+        finally:
+            todo_coord.suspect_claims_line = orig
+        self.assertEqual(calls, [])
+
+    def test_window_reminder_none_when_clean(self):
+        import coord_guards
+        self.assertIsNone(coord_guards.suspect_claims_reminder(self.con, ws_root=self.ws))
+
+
 class TestOwnerPrune(_DB):
     def _raw(self, topic, ids, at):
         self.con.execute('INSERT INTO coord_owner(topic, owner, todo_ids, updated_at)'

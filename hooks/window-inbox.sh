@@ -4,6 +4,7 @@
 #
 # 為什麼：#13 被 peer 喚醒的 153 段中，「讀完沒回」占 18% cache read（原估「只回收到」13% 經逐則檢查是裁決轉達，不計）。
 # peer 改把不需回應的回報寫收件匣（todo_cli inbox post），窗口醒來時一次看完，不另外喚醒。
+# 同一個時機順帶提醒可疑認領（孤兒／停滯，D-086），每 24 小時最多一次。
 # 非窗口不注入、也不標已讀。任何錯誤都靜默放行。
 INPUT="$(cat)"
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,6 +30,24 @@ try:
     msg = coord_guards.inbox_inject_text(items)
 except Exception:
     sys.exit(0)
+# 可疑認領提醒（D-086）。提醒要跑 git，以 3 秒鬧鐘為上限（外層 timeout 5 秒）：
+# 卡住時放棄提醒、照送收件匣，不能讓提醒拖垮收件匣。
+remind = None
+import signal
+class _Late(Exception):  # 不可用 TimeoutError：它是 OSError，會被 git 掃描內的 except OSError 吞掉
+    pass
+def _give_up(*_):
+    raise _Late
+try:
+    signal.signal(signal.SIGALRM, _give_up)
+    signal.alarm(3)
+    remind = coord_guards.suspect_claims_reminder(con)
+except Exception:
+    remind = None
+finally:
+    signal.alarm(0)
+if remind:
+    msg = f'{msg}\n\n{remind}' if msg else remind
 if msg:
     # 先送出再標已讀：中途被 timeout 打斷時，下次重複注入，不會遺失
     print(json.dumps({'hookSpecificOutput': {'hookEventName': 'UserPromptSubmit',

@@ -178,3 +178,29 @@ def inbox_inject_text(items):
         lines.append(f'- {i["created_at"][11:16]} {i["from_name"] or "?"}{tid}：{i["body"]}')
     lines.append('有需要處理的照常處理；純知會不必回覆（窗口不回純確認）。')
     return '\n'.join(lines)
+
+
+# ---------------------------------------------------------------- 可疑認領提醒（D-086）
+
+# 看板只在 SessionStart 注入，窗口一跑好幾天，看不到新冒出來的停滯認領；改在窗口被喚醒時
+# 提醒，但每 SUSPECT_REMIND_HOURS 小時最多一次 —— 每次喚醒都注入只會變成被略過的噪音。
+SUSPECT_REMIND_HOURS = 24
+_SUSPECT_META = ('_coord', 'suspect_claims_notified_at')
+
+
+def suspect_claims_reminder(con, now=None, ws_root=None):
+    import todo_coord
+    from datetime import datetime, timedelta
+    now = now or datetime.now()
+    fmt = '%Y-%m-%dT%H:%M:%S'
+    # 先查節流再掃：掃描要對每條候選跑 git，節流期內不必付這個成本
+    row = con.execute('SELECT v FROM doc_meta WHERE project=? AND k=?', _SUSPECT_META).fetchone()
+    if row and row[0] > (now - timedelta(hours=SUSPECT_REMIND_HOURS)).strftime(fmt):
+        return None
+    line = todo_coord.suspect_claims_line(con, ws_root)
+    if not line:
+        return None
+    con.execute('INSERT OR REPLACE INTO doc_meta VALUES(?,?,?)', (*_SUSPECT_META, now.strftime(fmt)))
+    con.commit()
+    return (line + f'\n窗口請逐條處置（每 {SUSPECT_REMIND_HOURS} 小時提醒一次）：沒人在做就釋放成 pending；'
+            '驗收依賴的環境已不存在就重評驗收條件，不要無限期等待。')
