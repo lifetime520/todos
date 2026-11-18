@@ -263,6 +263,12 @@ class TestStaleClaims(_DB):
         _, s = self._claim_old('session 名認領', 'tradingbot #3')
         self.assertEqual(self._stale_ids(), [s])
 
+    def test_unsafe_names_never_resolve_outside_root(self):
+        (Path(self.tmp.name) / 'outside').mkdir()
+        for bad in ('../outside', '*', '..', 'a/b', ''):
+            self.assertIsNone(todo_coord._ws_path(self.ws, bad, 'tradingbot'), bad)
+            self.assertIsNone(todo_coord._ws_path(self.ws, bad, None), bad)
+
     def test_board_line_lists_both_kinds(self):
         self._git_ws('spec2', commit_at='2026-01-01T00:00:00')
         _, s1 = self._claim_old('殘留', 'ws:spec2')

@@ -195,7 +195,24 @@ WS_ROOT = Path(os.environ.get('TODO_WS_ROOT') or Path.home() / 'WorkSpace' / 'ws
 def _ws_path(root, name, project=None):
     """session-ws 的工作區目錄是 <專案>-<名稱>。知道專案就精確比對；不知道才退回
     後綴比對（會把 ws:t2 誤認成 tradingbot-coinm-t2 —— 寧可少報孤兒，不誤報）。
-    找不到回 None。"""
+    找不到回 None。名稱只收 [A-Za-z0-9._-]、且結果必須仍在 root 底下：status_by 是自由字串，
+    不檢查的話 ws:../x 或 ws:* 會讓下游 git 跑在工作區根目錄以外的 repo。"""
+    if not _WS_NAME.fullmatch(name or '') or name in ('.', '..'):
+        return None
+    p = _ws_path_raw(root, name, project)
+    if p is None:
+        return None
+    try:
+        p.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    return p
+
+
+_WS_NAME = re.compile(r'[A-Za-z0-9._-]+')
+
+
+def _ws_path_raw(root, name, project):
     if (root / name).is_dir():
         return root / name
     if project:
@@ -244,12 +261,12 @@ def _ws_last_activity(path):
     DB 事件取最大值，讀不到等於不加分，不會讓條目被誤判為停滯以外的狀態。"""
     times = []
     try:
-        r = subprocess.run(['git', '-C', str(path), 'log', '-1', '--format=%ct', 'HEAD'],
+        r = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-C', str(path), 'log', '-1', '--format=%ct', 'HEAD'],
                            capture_output=True, text=True, timeout=_GIT_TIMEOUT_S)
         if r.returncode == 0 and r.stdout.strip():
             times.append(int(r.stdout.strip()))
         # --no-optional-locks：不順手寫回 index，免得和正在用這個工作區的 session 搶 index.lock
-        r = subprocess.run(['git', '-C', str(path), '--no-optional-locks', 'status', '--porcelain', '-z',
+        r = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-C', str(path), '--no-optional-locks', 'status', '--porcelain', '-z',
                             '--untracked-files=normal'],
                            capture_output=True, text=True, timeout=_GIT_TIMEOUT_S)
         if r.returncode == 0:
