@@ -17,7 +17,88 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
 import coord_guards as g
 
 
+class TestLastPromptSource(unittest.TestCase):
+    """這一輪是誰叫醒的：peer（cross-session 訊息）或 Cast 本人打字。"""
+
+    def _write(self, recs):
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in recs:
+            f.write(json.dumps(r, ensure_ascii=False) + '\n')
+        f.close()
+        self.addCleanup(Path(f.name).unlink)
+        return f.name
+
+    PEER = {'type': 'user', 'message': {'content': 'Another Claude session sent a message: '
+            '<cross-session-message from="uds:/x.sock" from-name="demo #13">【轉達】改接 T-1</cross-session-message>'}}
+    CAST = {'type': 'user', 'message': {'content': '幫我看一下 T-1'}}
+    TOOL = {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'ok'}]}}
+    NOTI = {'type': 'user', 'message': {'content': '<task-notification><status>completed</status></task-notification>'}}
+    ASST = {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': '好'}]}}
+
+    def test_peer_woke_this_turn(self):
+        # 2026-11-18 實例：#13 派 T-1004 給 #4，#4 中途用 AskUserQuestion 直接問 Cast
+        p = self._write([self.CAST, self.ASST, self.PEER, self.ASST, self.TOOL, self.NOTI, self.ASST])
+        self.assertEqual(g.last_prompt_source(p), 'peer')
+
+    def test_peer_message_flagged_meta_still_counts(self):
+        # 真實 transcript：cross-session 訊息的 user 紀錄帶 isMeta=True（#4 4d890a11… 11:08:00）
+        peer = dict(self.PEER, isMeta=True)
+        self.assertEqual(g.last_prompt_source(self._write([self.CAST, peer, self.TOOL])), 'peer')
+
+    def test_cast_typed_mid_turn_queued_command(self):
+        # 審查實證：session 忙碌時 Cast 打的字只記成 attachment/queued_command，origin.kind=human
+        q = {'type': 'attachment', 'attachment': {'type': 'queued_command', 'prompt': '這題直接問我',
+             'origin': {'kind': 'human'}}}
+        self.assertEqual(g.last_prompt_source(self._write([self.PEER, self.ASST, q, self.TOOL])), 'user')
+
+    def test_peer_mid_turn_queued_command(self):
+        q = {'type': 'attachment', 'attachment': {'type': 'queued_command', 'origin': {'kind': 'peer'},
+             'prompt': '<cross-session-message from-name="demo #13">【轉達】改派</cross-session-message>'}}
+        noti = {'type': 'attachment', 'attachment': {'type': 'queued_command', 'prompt': '<task-notification>x',
+                'origin': {'kind': 'task-notification'}}}
+        self.assertEqual(g.last_prompt_source(self._write([self.CAST, q, noti, self.TOOL])), 'peer')
+
+    def test_half_line_and_odd_records_skipped(self):
+        p = self._write([self.CAST, {'type': 'user', 'message': 'not-a-dict'},
+                         {'type': 'user', 'message': {'content': [{'type': 'text', 'text': None}]}}])
+        with open(p, 'a') as f:
+            f.write('{"type": "user", "message": {"content": "半行')
+        self.assertEqual(g.last_prompt_source(p), 'user')
+
+    def test_cast_typed_this_turn(self):
+        p = self._write([self.PEER, self.ASST, self.CAST, self.TOOL])
+        self.assertEqual(g.last_prompt_source(p), 'user')
+
+    def test_text_list_content_and_meta_skipped(self):
+        meta = {'type': 'user', 'isMeta': True, 'message': {'content': '<system-reminder>x</system-reminder>'}}
+        summ = {'type': 'user', 'isCompactSummary': True, 'message': {'content': 'This session is being continued'}}
+        cast = {'type': 'user', 'message': {'content': [{'type': 'text', 'text': '照做'}]}}
+        self.assertEqual(g.last_prompt_source(self._write([cast, meta, summ])), 'user')
+
+    def test_missing_or_empty(self):
+        self.assertIsNone(g.last_prompt_source('/nonexistent/x.jsonl'))
+        self.assertIsNone(g.last_prompt_source(self._write([self.TOOL])))
+        self.assertIsNone(g.last_prompt_source(None))
+
+
 class TestAskGuard(unittest.TestCase):
+    def test_impl_woken_by_peer_is_denied_and_redirected(self):
+        out = g.ask_guard('impl', woke_by='peer', window='demo #13')
+        self.assertEqual(out['permissionDecision'], 'deny')
+        r = out['permissionDecisionReason']
+        self.assertIn('demo #13', r)
+        self.assertIn('派工時加的限制', r)
+
+    def test_impl_cast_typed_or_unknown_not_denied(self):
+        self.assertIsNone(g.ask_guard('impl', woke_by='user', window='demo #13'))
+        self.assertIsNone(g.ask_guard('impl', woke_by=None, window='demo #13'))
+        self.assertIsNone(g.ask_guard('impl', woke_by='peer', window=None))
+
+    def test_only_impl_role_denied_when_peer_woke(self):
+        # #11（改進計劃，直屬 Cast）、#2（一般）、未登記角色被 peer 叫醒時仍可問 Cast
+        for role in ('improve', 'research', None):
+            self.assertIsNone(g.ask_guard(role, woke_by='peer', window='demo #13'), role)
+
     def test_window_is_denied(self):
         out = g.ask_guard('window')
         self.assertEqual(out['permissionDecision'], 'deny')
@@ -191,6 +272,15 @@ class TestHooksEndToEnd(unittest.TestCase):
         out = self._run('ask-window-guard.sh', {'session_id': 'sid-win',
                         'tool_input': {'questions': [{'question': '選哪個？', 'header': 'x'}]}})
         self.assertEqual(out['permissionDecision'], 'deny')
+
+    def test_ask_guard_denies_impl_woken_by_peer(self):
+        t = self.proj / 'peer.jsonl'
+        t.write_text(json.dumps({'type': 'user', 'message': {'content':
+            '<cross-session-message from-name="demo #13">【轉達】x</cross-session-message>'}}) + '\n')
+        out = self._run('ask-window-guard.sh', {'session_id': 'sid-imp', 'transcript_path': str(t),
+                        'tool_input': {'questions': [{'question': '要授權嗎？', 'header': 'x'}]}})
+        self.assertEqual(out['permissionDecision'], 'deny')
+        self.assertIn('demo #13', out['permissionDecisionReason'])
 
     def test_ask_guard_only_hints_impl(self):
         out = self._run('ask-window-guard.sh', {'session_id': 'sid-imp',

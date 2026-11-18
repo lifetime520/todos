@@ -6,7 +6,8 @@
 # 各自提問導致 Cast 在不知情下給出互相矛盾的指示（§5.5-3 30 小時翻三次；
 # D-006 vs D-005）。這個 hook 在提問前把「該送窗口」與「已有的裁決」放到模型眼前。
 #
-# 非窗口只提示、不阻擋：輸出 hookSpecificOutput.additionalContext，exit 恆為 0。
+# 非窗口：這一輪由 peer 叫醒時擋下、改問窗口（2026-11-18，#4 接 #13 派工後直接問 Cast）；
+# Cast 親自打字時只提示、不阻擋（輸出 additionalContext），exit 恆為 0。
 # 窗口本身一律擋下（2026-11-16 Cast 核准，#13 績效診斷）：AskUserQuestion 會讓窗口停擺，
 # #13 實測 17 次合計 3302 分鐘、期間 26 則 peer 訊息排隊。判斷邏輯在 coord_guards.ask_guard。
 # 任何錯誤（DB 鎖、找不到 session）都靜默放行。
@@ -40,7 +41,11 @@ try:
 except Exception:
     hits = []  # 裁決查詢失敗不影響窗口的 deny
 
-deny = coord_guards.ask_guard(r['role'] if r else None)
+try:
+    woke_by = coord_guards.last_prompt_source(inp.get('transcript_path'))
+except Exception:
+    woke_by = None  # 判斷失敗不得連帶取消窗口的 deny
+deny = coord_guards.ask_guard(r['role'] if r else None, woke_by, win)
 if deny:
     for d in hits:
         q = d['cast_quote'] if len(d['cast_quote']) <= 80 else d['cast_quote'][:79] + '…'

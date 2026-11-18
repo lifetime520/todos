@@ -20,20 +20,87 @@ LOCK_PREMISE = re.compile(r'不要(建議)?推翻|不得(挑戰|推翻|質疑)|�
 REVIEW_HINT = re.compile(r'審|review|audit|驗收|魔鬼|auditor', re.I)
 
 
-def ask_guard(role):
-    """窗口提問一律擋下，改純文字列選項；回傳 PreToolUse 的 hookSpecificOutput 片段或 None。"""
-    if role != 'window':
+_TAIL_BYTES = 4 * 1024 * 1024
+_NOT_A_PROMPT = ('<task-notification', '<local-command', '<command-name', '<system-reminder',
+                 'This session is being continued')
+
+
+def last_prompt_source(transcript_path):
+    """這一輪是誰叫醒的：最後一則真正的提示是 peer 的 cross-session 訊息回 'peer'，
+    Cast 本人打字回 'user'，判斷不了回 None。略過 tool_result、背景任務通知、meta、壓縮摘要。"""
+    import json
+    try:
+        size = os.path.getsize(transcript_path)
+        with open(transcript_path, 'rb') as f:
+            f.seek(max(0, size - _TAIL_BYTES))
+            lines = f.read().decode('utf-8', 'replace').splitlines()
+    except (OSError, TypeError, ValueError):
         return None
-    return {
-        'permissionDecision': 'deny',
-        'permissionDecisionReason': (
-            '【窗口禁用阻塞提問】AskUserQuestion 會讓窗口停擺、peer 全部排隊'
-            '（#13 實測 17 次合計 3302 分鐘）。'
-            '先判斷要不要問（協定第 12 條，2026-11-18）：你已有明確建議時，直接照建議執行，'
-            '用 todo_cli decision add 記錄並註明「窗口依建議裁示，Cast 可推翻」，在回報裡告知 Cast 即可。'
-            '只有拿不定主意，或動到真實資金／下單且難以挽回時，才用純文字列出 2～3 個選項與建議問 Cast，'
-            '然後結束回合，等候期間照常處理 peer 訊息。'),
-    }
+    for raw in reversed(lines):
+        try:
+            src = _prompt_source(json.loads(raw))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if src:
+            return src
+    return None
+
+
+def _prompt_source(rec):
+    """單筆紀錄是不是一則提示：回 'peer'／'user'，不是提示回 None。"""
+    if not isinstance(rec, dict):
+        return None
+    if rec.get('type') == 'attachment':
+        # session 忙碌時進來的訊息只記成 queued_command（Cast 打字 origin.kind=human）
+        a = rec.get('attachment') or {}
+        if a.get('type') != 'queued_command' or not isinstance(a.get('prompt'), str):
+            return None
+        if '<cross-session-message' in a['prompt']:
+            return 'peer'
+        return 'user' if (a.get('origin') or {}).get('kind') == 'human' else None
+    if rec.get('type') != 'user' or rec.get('isCompactSummary'):
+        return None
+    c = (rec.get('message') or {}).get('content')
+    if isinstance(c, list):
+        if any(isinstance(x, dict) and x.get('type') == 'tool_result' for x in c):
+            return None
+        c = ' '.join(x.get('text') or '' for x in c if isinstance(x, dict) and x.get('type') == 'text')
+    if not isinstance(c, str) or not c.strip():
+        return None
+    if '<cross-session-message' in c:  # 真實紀錄帶 isMeta=True，要先判，不能跟著 meta 一起略過
+        return 'peer'
+    if rec.get('isMeta') or c.lstrip().startswith(_NOT_A_PROMPT):
+        return None
+    return 'user'
+
+
+def ask_guard(role, woke_by=None, window=None):
+    """回傳 PreToolUse 的 hookSpecificOutput 片段（deny）或 None。
+    - 窗口：一律擋下（協定第 8、12 條）。
+    - 實作 session 這一輪是被 peer 叫醒的：擋下，改問窗口（2026-11-18 #4 接 #13 派工後直接問 Cast）。
+      Cast 親自在該 session 打字下指令時放行（協定第 2 條例外）。"""
+    if role == 'window':
+        return {
+            'permissionDecision': 'deny',
+            'permissionDecisionReason': (
+                '【窗口禁用阻塞提問】AskUserQuestion 會讓窗口停擺、peer 全部排隊'
+                '（#13 實測 17 次合計 3302 分鐘）。'
+                '先判斷要不要問（協定第 12 條，2026-11-18）：你已有明確建議時，直接照建議執行，'
+                '用 todo_cli decision add 記錄並註明「窗口依建議裁示，Cast 可推翻」，在回報裡告知 Cast 即可。'
+                '只有拿不定主意，或動到真實資金／下單且難以挽回時，才用純文字列出 2～3 個選項與建議問 Cast，'
+                '然後結束回合，等候期間照常處理 peer 訊息。'),
+        }
+    if role == 'impl' and woke_by == 'peer' and window:
+        return {
+            'permissionDecision': 'deny',
+            'permissionDecisionReason': (
+                f'【實作 session 不直接問 Cast】這一輪是 peer 叫醒的，題目由 {window} 調派。'
+                f'有疑問用 SendMessage 送 {window}（開頭帶【問題】或【阻塞】，附選項與建議），'
+                f'由 {window} 決定或代問 Cast（協定第 2、13 條）。'
+                f'你手上的「硬限制」若是 {window} 先前派工時加的限制，只對那一題有效；'
+                f'與新派工衝突時，以 {window} 最新的派工為準，有疑慮就問 {window}，不要繞過它問 Cast。'),
+        }
+    return None
 
 
 def design_docs_guard(tool_name, text, project_root, review_label=''):
