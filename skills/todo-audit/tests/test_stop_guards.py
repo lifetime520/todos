@@ -1,4 +1,4 @@
-"""stop_guards：回合結束守衛（2026-11-17，#11 空轉 19.5 小時檢討後 Cast 核准的改進 1、3）。
+"""stop_guards：回合結束守衛（2026-11-17 D-047；2026-11-18 D-067 撤掉未來式檢查，只留子程序盤點）。
 
 實證（#11 transcript 045b68fe…）：
 1. 11-17 03:09 回報結尾寫「下一步是 B……我會先提出具體設計……等你確認後再實作」後結束回合，
@@ -25,116 +25,6 @@ REAL_FAILURE = (
     '**下一步是 B（peer 回報批次化）**。這會改變所有 peer 的回報方式，我會先提出具體設計：'
     '哪些算緊急、收件檔的格式、#13 多久讀一次。等你確認後再實作。\n\n'
     '本 session 新增 0 條待辦、關閉 1 條（T-1014，tester #801 PASS 後自動結案）。')
-
-
-class TestFutureGuard(unittest.TestCase):
-    def test_real_failure_blocks(self):
-        r = g.future_guard(REAL_FAILURE, used_ask=False, stop_hook_active=False)
-        self.assertIsNotNone(r)
-        self.assertIn('AskUserQuestion', r)
-
-    def test_question_mark_in_tail_allows(self):
-        self.assertIsNone(g.future_guard('我會照 A 做。要用 A 還是 B？', False, False))
-
-    def test_used_ask_allows(self):
-        self.assertIsNone(g.future_guard(REAL_FAILURE, used_ask=True, stop_hook_active=False))
-
-    def test_stop_hook_active_allows(self):
-        self.assertIsNone(g.future_guard(REAL_FAILURE, used_ask=False, stop_hook_active=True))
-
-    def test_plain_completion_allows(self):
-        self.assertIsNone(g.future_guard('已完成，tester #801 PASS。本 session 新增 0 條。', False, False))
-
-    def test_future_phrase_only_far_above_tail_allows(self):
-        text = '我會先查 log。\n' + ('已查證。' * 300) + '\n結論：根因是 X，已修。'
-        self.assertIsNone(g.future_guard(text, False, False))
-
-    def test_other_future_forms_block(self):
-        for t in ('接下來我會補測試。', '稍後再處理 B。', '之後再做這段。', '等你回覆後再動手。'):
-            self.assertIsNotNone(g.future_guard(t, False, False), t)
-
-    def test_external_wait_allows(self):
-        for t in ('等 #744 跑完我會量，再補一筆 commit。', 'tester #801 PASS 後我會清工作區。',
-                  'Task 3 還在跑，完成後我會收到通知。', '結果回來後，我會整理成總評。',
-                  'fast 轉綠後，我會請審查者複審。', '跑完我會把 log 交回實作者。',
-                  '目前在跑 build 和單元測試。跑完會重新送審、提交、送 tester。',
-                  '全綠之後，我會把這兩處修正送原本那位 code-reviewer 複審。'):
-            self.assertIsNone(g.future_guard(t, False, False), t)
-
-    def test_user_wait_blocks_even_with_external_wait(self):
-        t = 'fast 跑完後我會整理設計，等你確認後再實作。'
-        self.assertIsNotNone(g.future_guard(t, False, False))
-
-    def test_waiting_on_user_without_question_blocks(self):
-        for t in ('設計文件還在等你核准，核准後我就寫實作計畫。', '還在等你決定。'):
-            self.assertIsNotNone(g.future_guard(t, False, False), t)
-
-    def test_unconditional_promise_blocks(self):
-        self.assertIsNotNone(g.future_guard('我會整理收尾清單給 #13，確認能不能結案。', False, False))
-
-    def test_external_wait_elsewhere_does_not_whitewash_promise(self):
-        # 審查發現 1：結案句裡的「PASS 後」不得放行另一句的無條件承諾
-        for t in ('我會先提出具體設計。\n\n本 session 關閉 1 條（T-1014，tester #801 PASS 後自動結案）。',
-                  '我會整理清單給 #13。（T-1000 已部署後驗證完）',
-                  '最後我會補文件。', '這段之後再做。', '我會先查；等 tester 跑完後就回報'):
-            self.assertIsNotNone(g.future_guard(t, False, False), t)
-
-    def test_benign_phrases_allowed(self):
-        # 審查發現 3
-        for t in ('我會議記錄已更新。', '下一步：無。全部完成。', '已修好。之後再有類似問題可以直接查 log。',
-                  '這次不需要等你確認，我已直接做完。', '不必等你確認，已做完。'):
-            self.assertIsNone(g.future_guard(t, False, False), t)
-
-    def test_quoted_phrases_ignored(self):
-        # 2026-11-18 實際誤擋：引述句型「還在等你決定」不是自己的承諾
-        for t in ('多數是「還在等你決定」卻沒用問句結尾，這是刻意要擋的。',
-                  '結尾寫了「我會先提出設計，等你確認後再實作」就結束回合。',
-                  '偵測 `我會` 這類字樣。'):
-            self.assertIsNone(g.future_guard(t, False, False), t)
-
-    def test_promise_outside_quotes_still_blocks(self):
-        self.assertIsNotNone(g.future_guard('「A」選項我會再研究，等你確認後再做。', False, False))
-
-    def test_empty_or_none_allows(self):
-        self.assertIsNone(g.future_guard('', False, False))
-        self.assertIsNone(g.future_guard(None, False, False))
-
-
-class TestTurnUsedAsk(unittest.TestCase):
-    def _write(self, records):
-        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
-        for r in records:
-            f.write(json.dumps(r, ensure_ascii=False) + '\n')
-        f.close()
-        self.addCleanup(Path(f.name).unlink)
-        return f.name
-
-    @staticmethod
-    def _user(text):
-        return {'type': 'user', 'message': {'role': 'user', 'content': text}}
-
-    @staticmethod
-    def _tool(name):
-        return {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': name, 'input': {}}]}}
-
-    @staticmethod
-    def _result():
-        return {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'ok'}]}}
-
-    def test_ask_in_current_turn(self):
-        p = self._write([self._user('hi'), self._tool('AskUserQuestion'), self._result(), self._tool('Bash'), self._result()])
-        self.assertTrue(g.turn_used_ask(p))
-
-    def test_ask_only_in_previous_turn(self):
-        p = self._write([self._user('a'), self._tool('AskUserQuestion'), self._result(), self._user('b'), self._tool('Bash'), self._result()])
-        self.assertFalse(g.turn_used_ask(p))
-
-    def test_odd_json_lines_skipped(self):
-        p = self._write([self._user('hi'), self._tool('AskUserQuestion'), 123, {'type': 'user', 'message': 'str'}, self._result()])
-        self.assertTrue(g.turn_used_ask(p))
-
-    def test_missing_file(self):
-        self.assertFalse(g.turn_used_ask('/nonexistent/x.jsonl'))
 
 
 class TestProcessGuard(unittest.TestCase):
@@ -241,10 +131,13 @@ class TestRunHook(unittest.TestCase):
         self._run({'session_id': 's1', 'stop_hook_active': False}, [(77, 9000, 'x')])
         self.assertFalse(old.exists())
 
-    def test_both_guards_combined(self):
+    def test_future_promise_no_longer_blocks(self):
+        # 2026-11-18 Cast 裁示全域撤掉未來式檢查（誤傷窗口：#13 回合結尾被逼成向 Cast 提問，73%）
+        self.assertIsNone(self._run({'session_id': 's1', 'stop_hook_active': False,
+                                     'last_assistant_message': REAL_FAILURE}, []))
         out = self._run({'session_id': 's1', 'stop_hook_active': False,
                          'last_assistant_message': REAL_FAILURE}, [(77, 9000, 'x')])
-        self.assertIn('未來式', out['reason'])
+        self.assertNotIn('未來式', out['reason'])
         self.assertIn('77', out['reason'])
 
     def test_active_allows_everything(self):
@@ -259,15 +152,12 @@ class TestHookEndToEnd(unittest.TestCase):
         env = dict(os.environ, HOME=home, STOP_GUARDS_SCRIPTS=str(Path(g.__file__).parent), STOP_GUARDS_NO_PROC='1')
         return subprocess.run(['bash', str(self.HOOK)], input=payload, capture_output=True, text=True, env=env, timeout=20)
 
-    def test_blocks_real_failure_then_allows_when_active(self):
+    def test_future_promise_passes_through_hook(self):
         with tempfile.TemporaryDirectory() as h:
             inp = {'session_id': 's1', 'transcript_path': '/nonexistent', 'stop_hook_active': False,
                 'last_assistant_message': REAL_FAILURE}
             out = self._run(json.dumps(inp, ensure_ascii=False), h)
-            self.assertEqual(out.returncode, 0)
-            self.assertEqual(json.loads(out.stdout)['decision'], 'block')
-            inp['stop_hook_active'] = True
-            self.assertEqual(self._run(json.dumps(inp, ensure_ascii=False), h).stdout.strip(), '')
+            self.assertEqual((out.returncode, out.stdout.strip()), (0, ''))
 
     def test_garbage_input_fails_open(self):
         with tempfile.TemporaryDirectory() as h:

@@ -23,53 +23,15 @@ class TestAskGuard(unittest.TestCase):
         self.assertEqual(out['permissionDecision'], 'deny')
         self.assertIn('純文字', out['permissionDecisionReason'])
 
+    def test_window_told_to_decide_on_own_recommendation(self):
+        # 2026-11-18 Cast：「他都已經有了答案，根本不需要問我」
+        r = g.ask_guard('window')['permissionDecisionReason']
+        self.assertIn('照建議執行', r)
+        self.assertIn('Cast 可推翻', r)
+
     def test_non_window_not_denied(self):
         self.assertIsNone(g.ask_guard('impl'))
         self.assertIsNone(g.ask_guard(None))
-
-
-class TestContextTokens(unittest.TestCase):
-    def _write(self, records, pad=0):
-        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
-        for r in records:
-            f.write(json.dumps(r) + '\n')
-        if pad:
-            f.write(json.dumps({'type': 'user', 'blob': 'x' * pad}) + '\n')
-        f.close()
-        self.addCleanup(Path(f.name).unlink)
-        return f.name
-
-    def test_last_assistant_usage_summed(self):
-        p = self._write([
-            {'type': 'assistant', 'message': {'usage': {
-                'input_tokens': 1, 'cache_read_input_tokens': 10, 'cache_creation_input_tokens': 5}}},
-            {'type': 'assistant', 'message': {'usage': {
-                'input_tokens': 2, 'cache_read_input_tokens': 200000, 'cache_creation_input_tokens': 3000}}},
-            {'type': 'user', 'message': {'content': 'hi'}},
-        ])
-        self.assertEqual(g.context_tokens(p), 203002)
-
-    def test_skips_trailing_huge_non_assistant_line(self):
-        p = self._write([{'type': 'assistant', 'message': {'usage': {
-            'input_tokens': 0, 'cache_read_input_tokens': 160000, 'cache_creation_input_tokens': 0}}}],
-            pad=300_000)
-        self.assertEqual(g.context_tokens(p), 160000)
-
-    def test_missing_file_or_no_usage_is_none(self):
-        self.assertIsNone(g.context_tokens('/nonexistent/x.jsonl'))
-        self.assertIsNone(g.context_tokens(self._write([{'type': 'user'}])))
-
-
-class TestContextGuard(unittest.TestCase):
-    def test_window_over_threshold_warns(self):
-        msg = g.context_guard('window', 210000)
-        self.assertIn('21 萬', msg)
-        self.assertIn('/remember', msg)
-
-    def test_under_threshold_or_not_window_silent(self):
-        self.assertIsNone(g.context_guard('window', 149999))
-        self.assertIsNone(g.context_guard('window', None))
-        self.assertIsNone(g.context_guard('impl', 400000))
 
 
 class TestDesignDocs(unittest.TestCase):
@@ -236,17 +198,6 @@ class TestHooksEndToEnd(unittest.TestCase):
         self.assertNotIn('permissionDecision', out)
         self.assertIn('demo #13', out['additionalContext'])
 
-    def test_context_guard_warns_window_once(self):
-        t = self.proj / 't.jsonl'
-        t.write_text(json.dumps({'type': 'assistant', 'message': {'usage': {
-            'input_tokens': 0, 'cache_read_input_tokens': 250000, 'cache_creation_input_tokens': 0}}}) + '\n')
-        payload = {'session_id': 'sid-win', 'transcript_path': str(t)}
-        first = self._run('window-context-guard.sh', payload)
-        self.assertIn('25 萬', first['additionalContext'])
-        self.assertIsNone(self._run('window-context-guard.sh', payload))  # 30 分鐘內不重複
-        self.assertIsNone(self._run('window-context-guard.sh',
-                                    {'session_id': 'sid-imp', 'transcript_path': str(t)}))
-
     def test_peer_message_guard_hook(self):
         deny = self._run('peer-message-guard.sh', {'session_id': 'sid-imp', 'tool_name': 'SendMessage',
                          'tool_input': {'to': 'demo #13', 'message': 'T-1 已推送'}})
@@ -270,14 +221,11 @@ class TestHooksEndToEnd(unittest.TestCase):
 
     def test_hooks_fail_open_on_garbage_input(self):
         import subprocess
-        for hook in ('ask-window-guard.sh', 'window-context-guard.sh', 'design-docs-guard.sh',
+        for hook in ('ask-window-guard.sh', 'design-docs-guard.sh',
                      'peer-message-guard.sh', 'window-inbox.sh'):
             r = subprocess.run(['bash', str(self.REPO / 'hooks' / hook)], cwd=self.proj,
                                input='not json{', capture_output=True, text=True, env=self.env)
             self.assertEqual((r.returncode, r.stdout.strip()), (0, ''), hook)
-        missing = self._run('window-context-guard.sh',
-                            {'session_id': 'sid-win', 'transcript_path': '/nonexistent.jsonl'})
-        self.assertIsNone(missing)
 
     def test_design_docs_guard_deny_and_hint(self):
         deny = self._run('design-docs-guard.sh', {'tool_name': 'Agent', 'cwd': str(self.proj),

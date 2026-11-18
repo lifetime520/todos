@@ -4,17 +4,12 @@
 b78b35ae-0016-4f7c-9ac4-430642a4bde4/report.md），Cast 核准的改進 1～3：
 1. 窗口禁用阻塞提問：AskUserQuestion 會讓窗口停擺，期間 peer 只能排隊
    （實測 17 次合計 3302 分鐘、26 則訊息排隊）。
-2. 窗口只當窗口＋context 輪替：每次被 peer 叫醒都要重讀整個 context
-   （首呼叫平均 20.8 萬、峰值 40 萬 token）。
+2. （已撤）context 輪替提醒：2026-11-18 Cast 裁示撤掉，窗口一直請 Cast /clear。
 3. 歸屬／記帳／資金費題先讀既有文件，審查 prompt 不得鎖定前提
    （S9b 被否決 5 輪；共審 prompt 寫「不要建議推翻」使審查者無從挑戰陷阱公式）。
 """
-import json
 import os
 import re
-
-CONTEXT_WARN_TOKENS = 150_000
-_TAIL_BYTES = 4 * 1024 * 1024
 
 DESIGN_KEYWORDS = re.compile(
     r'歸屬|記帳|帳本|對帳|資金費|淨倉|拆帳|attribution|funding', re.I)  # 不含 ledger：castpower 的 run 紀錄也叫 ledger
@@ -33,48 +28,12 @@ def ask_guard(role):
         'permissionDecision': 'deny',
         'permissionDecisionReason': (
             '【窗口禁用阻塞提問】AskUserQuestion 會讓窗口停擺、peer 全部排隊'
-            '（#13 實測 17 次合計 3302 分鐘）。改成：用純文字列出 2～3 個選項與建議，'
-            '結束本回合；等 Cast 回覆期間照常處理 peer 訊息。Cast 回覆後用 '
-            'todo_cli decision add 記錄裁決。'),
+            '（#13 實測 17 次合計 3302 分鐘）。'
+            '先判斷要不要問（協定第 12 條，2026-11-18）：你已有明確建議時，直接照建議執行，'
+            '用 todo_cli decision add 記錄並註明「窗口依建議裁示，Cast 可推翻」，在回報裡告知 Cast 即可。'
+            '只有拿不定主意，或動到真實資金／下單且難以挽回時，才用純文字列出 2～3 個選項與建議問 Cast，'
+            '然後結束回合，等候期間照常處理 peer 訊息。'),
     }
-
-
-def context_tokens(transcript_path):
-    """取 transcript 最後一筆 assistant 的 usage（input＋cache read＋cache create）；拿不到回 None。"""
-    try:
-        size = os.path.getsize(transcript_path)
-        with open(transcript_path, 'rb') as f:
-            f.seek(max(0, size - _TAIL_BYTES))
-            tail = f.read()
-    except OSError:
-        return None
-    for raw in reversed(tail.split(b'\n')):
-        if b'"assistant"' not in raw or b'"usage"' not in raw:
-            continue
-        try:
-            rec = json.loads(raw)
-        except ValueError:
-            continue
-        if rec.get('type') != 'assistant':
-            continue
-        u = (rec.get('message') or {}).get('usage')
-        if not isinstance(u, dict):
-            continue
-        return sum(int(u.get(k) or 0) for k in
-                   ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'))
-    return None
-
-
-def context_guard(role, tokens):
-    """窗口 context 超過門檻時回傳提醒文字，否則 None。"""
-    if role != 'window' or tokens is None or tokens < CONTEXT_WARN_TOKENS:
-        return None
-    return (f'【窗口 context {tokens // 10000} 萬 token，已超過 {CONTEXT_WARN_TOKENS // 10000} 萬】'
-            '每次被 peer 叫醒都要重讀整個 context。處理完手上這則後：'
-            '用 /remember 寫交接（進行中題目、待 Cast 裁決、等待中的 peer），'
-            '再告訴 Cast「窗口需要輪替」，請他 /clear 後讓新 context 接手。'
-            '窗口只做轉達、派工、裁決記錄：研究或設計題轉派短命 session 或 castpower；'
-            '實作與 peer 交付核對交給 peer 或 tester，不要自己重跑。')
 
 
 def design_docs_guard(tool_name, text, project_root, review_label=''):

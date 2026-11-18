@@ -113,8 +113,8 @@ ln -sfn "$REPO/docs/TODO-SYSTEM.md" ~/.claude/docs/TODO-SYSTEM.md
 | `SessionStart` | `bash ~/.claude/hooks/todo-startup.sh` |
 | `Stop` | `bash ~/.claude/hooks/todo-reminder.sh` |
 | `PreToolUse`（Read\|Grep\|Glob\|Bash） | `bash ~/.claude/hooks/todo-guard.sh` |
-| `Stop` | `bash ~/.claude/hooks/stop-guards.sh`（未來式承諾沒提問擋一次、長壽子程序盤點；D-047） |
-| `UserPromptSubmit` | `bash ~/.claude/hooks/window-context-guard.sh`、`bash ~/.claude/hooks/window-inbox.sh`（窗口收件匣注入；D-048） |
+| `Stop` | `bash ~/.claude/hooks/stop-guards.sh`（長壽子程序盤點；D-047。未來式檢查 2026-11-18 撤掉） |
+| `UserPromptSubmit` | `bash ~/.claude/hooks/window-inbox.sh`（窗口收件匣注入；D-048） |
 | `PreToolUse`（AskUserQuestion） | `bash ~/.claude/hooks/ask-window-guard.sh` |
 | `PreToolUse`（Agent\|SendMessage） | `bash ~/.claude/hooks/design-docs-guard.sh` |
 | `PreToolUse`（SendMessage） | `bash ~/.claude/hooks/peer-message-guard.sh`（送窗口要帶標籤；D-048） |
